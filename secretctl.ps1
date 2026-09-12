@@ -163,7 +163,10 @@ function Cmd-Capture([string[]]$rest) {
         Write-Error "Usage: secretctl capture -Name <name> [-Force] -- <command> [args...]"
     }
     $cmd = $rest[$sepIdx + 1]
-    $cmdArgs = $rest[($sepIdx + 2)..($rest.Length - 1)]
+    $cmdArgs = @()
+    if ($sepIdx + 2 -le $rest.Length - 1) {
+        $cmdArgs = @($rest[($sepIdx + 2)..($rest.Length - 1)])
+    }
 
     $vault = Load-Vault
     if ($vault.ContainsKey($Name) -and -not $Force) {
@@ -176,7 +179,12 @@ function Cmd-Capture([string[]]$rest) {
     }
     $plain = ($output | Out-String).Trim()
     if ([string]::IsNullOrEmpty($plain)) {
-        Write-Error "Captured command produced no output; nothing stored."
+        $resolved = Get-Command $cmd -ErrorAction SilentlyContinue | Select-Object -First 1
+        $hint = ''
+        if ($resolved -and $resolved.Source -and $resolved.Source -notmatch '\.(exe|cmd|bat|ps1)$') {
+            $hint = " '$cmd' resolved to '$($resolved.Source)', which has no Windows-executable extension - it may be a POSIX shell shim pwsh can't spawn and capture output from. Try the '.cmd' or '.exe' variant on PATH instead (e.g. '$cmd.cmd')."
+        }
+        Write-Error "Captured command produced no output; nothing stored.$hint"
     }
 
     $now = (Get-Date).ToUniversalTime().ToString('o')
@@ -401,7 +409,10 @@ function Cmd-Run([string[]]$rest) {
     }
     $flagsPart = $rest[0..($sepIdx - 1)]
     $cmd = $rest[$sepIdx + 1]
-    $cmdArgs = if ($sepIdx + 2 -le $rest.Length - 1) { $rest[($sepIdx + 2)..($rest.Length - 1)] } else { @() }
+    $cmdArgs = @()
+    if ($sepIdx + 2 -le $rest.Length - 1) {
+        $cmdArgs = @($rest[($sepIdx + 2)..($rest.Length - 1)])
+    }
 
     $Name = Get-Named $flagsPart '-Name'
     $As   = Get-Named $flagsPart '-As' $Name
