@@ -227,6 +227,7 @@ function Cmd-Generate([string[]]$rest) {
         preview  = Get-Preview $plain
         source   = 'generated'
         pushedTo = @()
+        allowedTargets = @()
     }
     Save-Vault $vault
     Write-Audit 'generate' $Name
@@ -276,6 +277,7 @@ function Cmd-Capture([string[]]$rest) {
         preview  = Get-Preview $plain
         source   = "captured:$cmd"
         pushedTo = @()
+        allowedTargets = @()
     }
     Save-Vault $vault
     Write-Audit 'capture' $Name
@@ -308,6 +310,7 @@ function Cmd-Set([string[]]$rest) {
         preview  = Get-Preview $plain
         source   = 'manual'
         pushedTo = @()
+        allowedTargets = @()
     }
     Save-Vault $vault
     Write-Audit 'set' $Name
@@ -340,6 +343,7 @@ function Cmd-ImportFile([string[]]$rest) {
         preview  = Get-Preview $plain
         source   = "imported-file"
         pushedTo = @()
+        allowedTargets = @()
     }
     Save-Vault $vault
     Write-Audit 'import-file' $Name
@@ -421,7 +425,12 @@ function Push-ToWrangler([string]$plain, [string]$workerName, [string]$envName, 
 
 function Assert-TargetAllowed([hashtable]$vault, [string]$Name, [string]$Target) {
     $entry = $vault[$Name]
-    $allowed = @($entry.allowedTargets) + @($entry.pushedTo | ForEach-Object { $_.target })
+    # Bracket indexing, not dot-notation: entries created before destination
+    # allow-listing existed have no 'allowedTargets' key at all, and under a
+    # caller session running Set-StrictMode -Version 2+ (e.g. VS Code's
+    # PowerShell Integrated Console), dot-notation on a missing hashtable key
+    # throws PropertyNotFoundException instead of returning $null.
+    $allowed = @($entry['allowedTargets']) + @($entry['pushedTo'] | ForEach-Object { $_.target })
     $allowed = @($allowed | Where-Object { $_ } | Select-Object -Unique)
     if ($allowed -contains $Target) { return }
 
@@ -431,7 +440,7 @@ function Assert-TargetAllowed([hashtable]$vault, [string]$Name, [string]$Target)
     $confirm = Read-Host "'$Name' has never been approved for target '$Target'. Type the secret name to approve this destination"
     if ($confirm -ne $Name) { Write-Error "Confirmation did not match; aborted." }
 
-    $allowedList = @($entry.allowedTargets) + @($Target)
+    $allowedList = @($entry['allowedTargets']) + @($Target)
     $entry.allowedTargets = $allowedList
     $vault[$Name] = $entry
     Save-Vault $vault
@@ -451,7 +460,7 @@ function Cmd-Allow([string[]]$rest) {
     if ($confirm -ne $Name) { Write-Error "Confirmation did not match; aborted." }
 
     $entry = $vault[$Name]
-    $allowed = @($entry.allowedTargets)
+    $allowed = @($entry['allowedTargets'])
     if ($allowed -notcontains $Target) { $allowed += $Target }
     $entry.allowedTargets = $allowed
     $vault[$Name] = $entry
