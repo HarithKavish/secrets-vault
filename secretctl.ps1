@@ -111,6 +111,14 @@ function Has-Flag([string[]]$rest, [string]$flag) {
     return ($rest -contains $flag)
 }
 
+function Get-AllNamed([string[]]$rest, [string]$flag) {
+    $values = @()
+    for ($i = 0; $i -lt $rest.Length; $i++) {
+        if ($rest[$i] -eq $flag -and $i + 1 -lt $rest.Length) { $values += $rest[$i + 1] }
+    }
+    return $values
+}
+
 function Require-Entry([hashtable]$vault, [string]$Name) {
     if (-not $vault.ContainsKey($Name)) {
         Write-Error "No secret named '$Name' in vault."
@@ -386,6 +394,66 @@ function Cmd-Rotate([string[]]$rest) {
     $plain = $null
 }
 
+function Cmd-Run([string[]]$rest) {
+    $sepIdx = [array]::IndexOf($rest, '--')
+    if ($sepIdx -lt 0 -or $sepIdx -eq $rest.Length - 1) {
+        Write-Error "Usage: secretctl run [-Name <n> [-As <ENV_VAR>]] [-Env ENV_VAR=VaultName ...] -- <command> [args...]"
+    }
+    $flagsPart = $rest[0..($sepIdx - 1)]
+    $cmd = $rest[$sepIdx + 1]
+    $cmdArgs = if ($sepIdx + 2 -le $rest.Length - 1) { $rest[($sepIdx + 2)..($rest.Length - 1)] } else { @() }
+
+    $Name = Get-Named $flagsPart '-Name'
+    $As   = Get-Named $flagsPart '-As' $Name
+
+    $envPairs = @()
+    if ($Name) { $envPairs += @{ envVar = $As; vaultName = $Name } }
+    foreach ($spec in (Get-AllNamed $flagsPart '-Env')) {
+        $parts = $spec -split '=', 2
+        if ($parts.Length -ne 2 -or -not $parts[0] -or -not $parts[1]) {
+            Write-Error "Invalid -Env spec '$spec'; expected ENV_VAR=VaultName."
+        }
+        $envPairs += @{ envVar = $parts[0]; vaultName = $parts[1] }
+    }
+    if ($envPairs.Count -eq 0) {
+        Write-Error "No secrets specified. Use -Name <n> [-As ENV_VAR] and/or -Env ENV_VAR=VaultName."
+    }
+
+    $vault = Load-Vault
+    foreach ($p in $envPairs) { Require-Entry $vault $p.vaultName }
+
+    $plainValues = @{}
+    $savedEnv = @{}
+    foreach ($p in $envPairs) {
+        $plainValues[$p.envVar] = Unprotect-Value $vault[$p.vaultName].cipher
+    }
+
+    $exitCode = 0
+    $output = ''
+    try {
+        foreach ($k in $plainValues.Keys) {
+            $savedEnv[$k] = [Environment]::GetEnvironmentVariable($k)
+            [Environment]::SetEnvironmentVariable($k, $plainValues[$k])
+        }
+        $output = (& $cmd @cmdArgs 2>&1 | Out-String)
+        $exitCode = if ($LASTEXITCODE) { $LASTEXITCODE } else { 0 }
+    }
+    finally {
+        foreach ($k in $savedEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $savedEnv[$k]) }
+    }
+
+    foreach ($v in $plainValues.Values) {
+        if ($v) { $output = $output.Replace($v, '[REDACTED]') }
+    }
+    $plainValues.Clear()
+
+    Write-Output $output
+    Write-Audit 'run' (($envPairs | ForEach-Object { $_.vaultName }) -join ',') $cmd
+    if ($exitCode -ne 0) {
+        Write-Error "Command '$cmd' exited with code $exitCode (output above; any secret values redacted)."
+    }
+}
+
 function Cmd-Delete([string[]]$rest) {
     $Name  = Get-Named $rest '-Name'
     $Force = Has-Flag $rest '-Force'
@@ -429,6 +497,7 @@ secretctl - local blind secret broker (values never printed to agent-visible out
   secretctl import-file -Name <n> -Path <file> [-Delete] [-Force]
   secretctl list
   secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|file:<path> [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name]
+  secretctl run         [-Name <n> [-As ENV_VAR]] [-Env ENV_VAR=VaultName ...] -- <command> [args...]
   secretctl rotate      -Name <n> [-RepushAll]
   secretctl delete      -Name <n> [-Force]
   secretctl reveal      -Name <n>                                (interactive humans only)
@@ -448,6 +517,7 @@ switch ($verb) {
     'import-file' { Cmd-ImportFile $rest }
     'list'        { Cmd-List $rest }
     'push'        { Cmd-Push $rest }
+    'run'         { Cmd-Run $rest }
     'rotate'      { Cmd-Rotate $rest }
     'delete'      { Cmd-Delete $rest }
     'reveal'      { Cmd-Reveal $rest }
