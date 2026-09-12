@@ -53,6 +53,13 @@ terminal.
   set`, `vercel env add`) or writes a file line directly — never as a CLI
   argument, since process arguments are visible to other local processes
   (Task Manager, WMI, `ps`).
+- **Run**: `secretctl run -Name X -- <command>` injects the decrypted value
+  into that one child process's environment, then scans the child's combined
+  stdout/stderr and replaces every literal occurrence of the value with
+  `[REDACTED]` before printing it. This covers the case a plain env-var
+  injection doesn't: a subprocess that echoes the secret back in an error
+  message (a malformed-connection-string exception, a verbose driver log)
+  never actually leaks it to whatever is reading the command's output.
 
 ## Usage
 
@@ -64,6 +71,7 @@ secretctl import-file -Name <n> -Path <file> [-Delete] [-Force]
 secretctl list
 secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|file:<path>
                        [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name]
+secretctl run          [-Name <n> [-As ENV_VAR]] [-Env ENV_VAR=VaultName ...] -- <command> [args...]
 secretctl rotate      -Name <n> [-RepushAll]
 secretctl delete      -Name <n> [-Force]
 secretctl reveal      -Name <n>                                (interactive humans only)
@@ -85,6 +93,21 @@ At no point does the value appear in either command's output.
 secretctl capture -Name GH_TOKEN -- gh auth token
 secretctl push -Name GH_TOKEN -Target file:.env -EnvName GH_TOKEN
 ```
+
+### Example: run a migration against a write-only ("Sensitive") Vercel var
+
+A Vercel env var marked Sensitive is write-only forever — no dashboard reveal,
+no `vercel env pull`, no API call ever returns it again, by design. Get it
+from the actual issuer once, then always run against it blind:
+
+```
+secretctl capture -Name DATABASE_URL -- neon connection-string
+secretctl run -Name DATABASE_URL -- npm run db:migrate
+```
+
+Neither command ever prints the connection string — not on success, and not
+if the migration tool's own error handling tries to echo the value it was
+given.
 
 ## Install
 
