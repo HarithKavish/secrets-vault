@@ -39,8 +39,23 @@ terminal.
   rest with Windows DPAPI (`ConvertTo-SecureString` / `ConvertFrom-SecureString`,
   no explicit key), which ties decryption to this Windows user account and
   machine. Copying the file elsewhere does not help an attacker decrypt it.
-- **Audit log**: `%LOCALAPPDATA%\secretctl\audit.log` — append-only JSON
-  lines recording verb, secret name, target, and timestamp. Never values.
+- **Audit log**: `%LOCALAPPDATA%\secretctl\audit.log` — append-only,
+  hash-chained JSON lines recording verb, secret name, target, and timestamp
+  (never values). Each entry's hash covers the previous entry's hash, so
+  editing or deleting a past line breaks the chain; `secretctl audit-verify`
+  walks the whole log and reports the first broken link.
+- **Destination allow-list**: a secret can only be pushed to a target it has
+  already been pushed to, or one approved via `secretctl allow`. The first
+  push to any new target always requires an interactive human to confirm it —
+  it fails closed exactly like `reveal`/`set` for a non-interactive caller —
+  then that target is remembered for that secret going forward. This is what
+  stops a manipulated or mistaken agent instruction from silently redirecting
+  a real secret to an unintended destination; it doesn't require re-approval
+  for routine, already-established automation.
+- **Vault directory permissions**: the vault directory's ACL is reset to grant
+  only the current user (by SID) and SYSTEM, removing any broader inherited
+  access. This is defense in depth — DPAPI encryption is what actually
+  protects the values even if another local account could read the file.
 - **Generation**: secrets are produced with a CSPRNG
   (`RandomNumberGenerator`), never by asking a language model to invent
   entropy.
@@ -75,6 +90,8 @@ secretctl run          [-Name <n> [-As ENV_VAR]] [-Env ENV_VAR=VaultName ...] --
 secretctl rotate      -Name <n> [-RepushAll]
 secretctl delete      -Name <n> [-Force]
 secretctl reveal      -Name <n>                                (interactive humans only)
+secretctl allow       -Name <n> -Target <target-spec>          (interactive humans only)
+secretctl audit-verify
 ```
 
 ### Example: generate a secret and push it to GitHub Actions and Vercel

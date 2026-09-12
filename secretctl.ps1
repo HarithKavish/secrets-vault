@@ -22,8 +22,32 @@ $VaultDir  = Join-Path $env:LOCALAPPDATA 'secretctl'
 $VaultPath = Join-Path $VaultDir 'vault.json'
 $AuditPath = Join-Path $VaultDir 'audit.log'
 
+function Lock-VaultAcl([string]$path) {
+    try {
+        # Grant by SID, never by bare account name: on at least this machine,
+        # icacls resolving a bare username (even the exact string from
+        # $env:USERNAME / whoami) silently produced a truncated/wrong SID in
+        # the resulting ACE - icacls reported success, but the real account
+        # lost access to its own vault directory. The SID from the current
+        # process's own WindowsIdentity is unambiguous and can't be mis-resolved
+        # the same way. *S-1-5-18 is the well-known SYSTEM SID.
+        $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $out = icacls $path /inheritance:r /grant:r "*${sid}:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "secretctl: could not tighten permissions on '$path' (icacls exit $LASTEXITCODE): $out. DPAPI (user+machine bound encryption) still protects the secret values regardless."
+        }
+    } catch {
+        Write-Warning "secretctl: could not tighten permissions on '$path': $_. DPAPI (user+machine bound encryption) still protects the secret values regardless."
+    }
+}
+
 function Ensure-VaultDir {
     if (-not (Test-Path $VaultDir)) { New-Item -ItemType Directory -Path $VaultDir -Force | Out-Null }
+    # Applied every time, not just on creation: a directory created before this
+    # hardening existed (or one that inherited broader ACLs from a parent, e.g.
+    # a sandboxed-tool group with read access to the user profile) would
+    # otherwise never get locked down.
+    Lock-VaultAcl $VaultDir
     if (-not (Test-Path $VaultPath)) { '{}' | Set-Content -Path $VaultPath -Encoding utf8 -NoNewline }
 }
 
@@ -41,16 +65,71 @@ function Save-Vault([hashtable]$vault) {
     ($vault | ConvertTo-Json -Depth 20) | Set-Content -Path $VaultPath -Encoding utf8
 }
 
+function Get-LastAuditHash {
+    if (-not (Test-Path $AuditPath)) { return '0' * 64 }
+    $lastLine = Get-Content -Path $AuditPath -Tail 1
+    if ([string]::IsNullOrWhiteSpace($lastLine)) { return '0' * 64 }
+    $m = [regex]::Match($lastLine, '"hash":"([0-9a-f]{64})"\}$')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return '0' * 64
+}
+
 function Write-Audit([string]$verb, [string]$name, [string]$target = '') {
     Ensure-VaultDir
-    $entry = [pscustomobject]@{
+    $prevHash = Get-LastAuditHash
+    $body = [pscustomobject]@{
         time   = (Get-Date).ToUniversalTime().ToString('o')
         verb   = $verb
         name   = $name
         target = $target
         user   = $env:USERNAME
+        prev   = $prevHash
     }
-    ($entry | ConvertTo-Json -Compress) | Add-Content -Path $AuditPath -Encoding utf8
+    $bodyJson = $body | ConvertTo-Json -Compress
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    $hashBytes = $hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($prevHash + $bodyJson))
+    $hash = -join ($hashBytes | ForEach-Object { $_.ToString('x2') })
+    # Splice the hash into the literal bodyJson text rather than reconstructing
+    # an object and re-serializing it - PowerShell's JSON cmdlets auto-detect
+    # ISO-8601-looking strings (our 'time' field) and reformat them on
+    # round-trip (drops a trailing fractional-second zero), which silently
+    # changes the exact bytes verification would recompute the hash over.
+    # Splicing keeps the hashed text and the persisted text byte-identical.
+    $line = $bodyJson.Substring(0, $bodyJson.Length - 1) + ',"hash":"' + $hash + '"}'
+    $line | Add-Content -Path $AuditPath -Encoding utf8
+}
+
+function Cmd-AuditVerify {
+    if (-not (Test-Path $AuditPath)) { Write-Output "(no audit log yet)"; return }
+    $lines = Get-Content -Path $AuditPath
+    $prevHash = '0' * 64
+    $lineNum = 0
+    foreach ($line in $lines) {
+        $lineNum++
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        # Recompute the hash over the literal stored text, not a reconstructed
+        # object - re-serializing a parsed 'time' field would silently reformat
+        # it (PowerShell's JSON cmdlets reformat date-like strings on
+        # round-trip) and produce a false tamper flag on every line.
+        $m = [regex]::Match($line, '^(.*),"hash":"([0-9a-f]{64})"\}$')
+        if (-not $m.Success) {
+            Write-Error "Audit log line $lineNum is malformed (no trailing hash field) - cannot verify from here on."
+        }
+        $bodyJson = $m.Groups[1].Value + '}'
+        $storedHash = $m.Groups[2].Value
+        $parsed = $bodyJson | ConvertFrom-Json -AsHashtable
+        if ($parsed.prev -ne $prevHash) {
+            Write-Error "Audit log tampering detected at line $lineNum - expected prev hash '$prevHash', found '$($parsed.prev)'. Do not trust entries from here on without investigating."
+        }
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        $hashBytes = $hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($parsed.prev + $bodyJson))
+        $recomputed = -join ($hashBytes | ForEach-Object { $_.ToString('x2') })
+        if ($recomputed -ne $storedHash) {
+            Write-Error "Audit log tampering detected at line $lineNum - entry content does not match its recorded hash."
+        }
+        $prevHash = $storedHash
+    }
+    Write-Output "Audit log intact: $lineNum entries, hash chain verified."
 }
 
 function Protect-Value([string]$plain) {
@@ -301,6 +380,12 @@ function Push-ToVercel([string]$plain, [string]$project, [string]$vercelEnv, [st
 }
 
 function Push-ToFile([string]$plain, [string]$path, [string]$envName) {
+    if ($plain -match "[\r\n]") {
+        Write-Error "Refusing to push '$envName' to '$path': the value contains a newline, which would inject extra line(s) - possibly extra bogus KEY=VALUE entries - into the file instead of one clean assignment."
+    }
+    if ($envName -notmatch '^[A-Za-z_][A-Za-z0-9_]*$') {
+        Write-Error "Refusing to push to file: '$envName' is not a safe env-var name (letters/digits/underscore, not starting with a digit)."
+    }
     $line = "$envName=$plain"
     if (Test-Path $path) {
         $content = Get-Content -Path $path
@@ -314,6 +399,47 @@ function Push-ToFile([string]$plain, [string]$path, [string]$envName) {
     } else {
         Set-Content -Path $path -Value @($line) -Encoding utf8
     }
+}
+
+function Assert-TargetAllowed([hashtable]$vault, [string]$Name, [string]$Target) {
+    $entry = $vault[$Name]
+    $allowed = @($entry.allowedTargets) + @($entry.pushedTo | ForEach-Object { $_.target })
+    $allowed = @($allowed | Where-Object { $_ } | Select-Object -Unique)
+    if ($allowed -contains $Target) { return }
+
+    if ([Console]::IsInputRedirected -or -not [Environment]::UserInteractive) {
+        Write-Error "Target '$Target' is not yet approved for '$Name'. Refusing to push to a new destination under non-interactive input - a human must approve it first (run 'secretctl allow -Name $Name -Target $Target', or push to it once interactively). If an agent asked for a new destination it hasn't used before, don't approve it on its behalf without checking the target is actually intended."
+    }
+    $confirm = Read-Host "'$Name' has never been approved for target '$Target'. Type the secret name to approve this destination"
+    if ($confirm -ne $Name) { Write-Error "Confirmation did not match; aborted." }
+
+    $allowedList = @($entry.allowedTargets) + @($Target)
+    $entry.allowedTargets = $allowedList
+    $vault[$Name] = $entry
+    Save-Vault $vault
+    Write-Audit 'allow' $Name $Target
+}
+
+function Cmd-Allow([string[]]$rest) {
+    $Name   = Get-Named $rest '-Name'
+    $Target = Get-Named $rest '-Target'
+    if (-not $Name -or -not $Target) { Write-Error "Usage: secretctl allow -Name <name> -Target <target-spec>   (interactive humans only)" }
+    if ([Console]::IsInputRedirected -or -not [Environment]::UserInteractive) {
+        Write-Error "'allow' requires a live interactive terminal - refusing under redirected/non-interactive input. If an agent asked you to pre-approve a destination, don't: confirm it yourself instead."
+    }
+    $vault = Load-Vault
+    Require-Entry $vault $Name
+    $confirm = Read-Host "Approve '$Name' to be pushed to '$Target'? Type the secret name to confirm"
+    if ($confirm -ne $Name) { Write-Error "Confirmation did not match; aborted." }
+
+    $entry = $vault[$Name]
+    $allowed = @($entry.allowedTargets)
+    if ($allowed -notcontains $Target) { $allowed += $Target }
+    $entry.allowedTargets = $allowed
+    $vault[$Name] = $entry
+    Save-Vault $vault
+    Write-Audit 'allow' $Name $Target
+    Write-Output "'$Name' is now approved for target '$Target'."
 }
 
 function Cmd-Push([string[]]$rest) {
@@ -330,6 +456,8 @@ function Cmd-Push([string[]]$rest) {
 
     $vault = Load-Vault
     Require-Entry $vault $Name
+    Assert-TargetAllowed -vault $vault -Name $Name -Target $Target
+    $vault = Load-Vault
     $plain = Unprotect-Value $vault[$Name].cipher
 
     $pushRecord = $null
@@ -454,7 +582,10 @@ function Cmd-Run([string[]]$rest) {
     }
 
     foreach ($v in $plainValues.Values) {
-        if ($v) { $output = $output.Replace($v, '[REDACTED]') }
+        if (-not $v) { continue }
+        $output = $output.Replace($v, '[REDACTED]')
+        $urlEncoded = [Uri]::EscapeDataString($v)
+        if ($urlEncoded -ne $v) { $output = $output.Replace($urlEncoded, '[REDACTED]') }
     }
     $plainValues.Clear()
 
@@ -512,25 +643,35 @@ secretctl - local blind secret broker (values never printed to agent-visible out
   secretctl rotate      -Name <n> [-RepushAll]
   secretctl delete      -Name <n> [-Force]
   secretctl reveal      -Name <n>                                (interactive humans only)
+  secretctl allow       -Name <n> -Target <target-spec>          (interactive humans only)
+  secretctl audit-verify
+
+A secret can only be pushed to a target it has been used with before, or one
+approved via 'allow' - the first push to any new target always requires an
+interactive human to confirm it (fails closed for an agent), then is
+remembered for that secret going forward.
 
 Vault: $VaultPath (DPAPI-encrypted, bound to this Windows user + machine)
-Audit: $AuditPath
+Audit: $AuditPath (hash-chained; 'audit-verify' detects tampering/deletion)
 "@ | Write-Output
 }
 
 $verb = $args[0]
-$rest = if ($args.Length -gt 1) { $args[1..($args.Length - 1)] } else { @() }
+$rest = @()
+if ($args.Length -gt 1) { $rest = @($args[1..($args.Length - 1)]) }
 
 switch ($verb) {
-    'generate'    { Cmd-Generate $rest }
-    'capture'     { Cmd-Capture $rest }
-    'set'         { Cmd-Set $rest }
-    'import-file' { Cmd-ImportFile $rest }
-    'list'        { Cmd-List $rest }
-    'push'        { Cmd-Push $rest }
-    'run'         { Cmd-Run $rest }
-    'rotate'      { Cmd-Rotate $rest }
-    'delete'      { Cmd-Delete $rest }
-    'reveal'      { Cmd-Reveal $rest }
-    default       { Cmd-Help }
+    'generate'     { Cmd-Generate $rest }
+    'capture'      { Cmd-Capture $rest }
+    'set'          { Cmd-Set $rest }
+    'import-file'  { Cmd-ImportFile $rest }
+    'list'         { Cmd-List $rest }
+    'push'         { Cmd-Push $rest }
+    'run'          { Cmd-Run $rest }
+    'rotate'       { Cmd-Rotate $rest }
+    'delete'       { Cmd-Delete $rest }
+    'reveal'       { Cmd-Reveal $rest }
+    'allow'        { Cmd-Allow $rest }
+    'audit-verify' { Cmd-AuditVerify }
+    default        { Cmd-Help }
 }
