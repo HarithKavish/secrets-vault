@@ -39,8 +39,23 @@ terminal.
   rest with Windows DPAPI (`ConvertTo-SecureString` / `ConvertFrom-SecureString`,
   no explicit key), which ties decryption to this Windows user account and
   machine. Copying the file elsewhere does not help an attacker decrypt it.
-- **Audit log**: `%LOCALAPPDATA%\secretctl\audit.log` — append-only JSON
-  lines recording verb, secret name, target, and timestamp. Never values.
+- **Audit log**: `%LOCALAPPDATA%\secretctl\audit.log` — append-only,
+  hash-chained JSON lines recording verb, secret name, target, and timestamp
+  (never values). Each entry's hash covers the previous entry's hash, so
+  editing or deleting a past line breaks the chain; `secretctl audit-verify`
+  walks the whole log and reports the first broken link.
+- **Destination allow-list**: a secret can only be pushed to a target it has
+  already been pushed to, or one approved via `secretctl allow`. The first
+  push to any new target always requires an interactive human to confirm it —
+  it fails closed exactly like `reveal`/`set` for a non-interactive caller —
+  then that target is remembered for that secret going forward. This is what
+  stops a manipulated or mistaken agent instruction from silently redirecting
+  a real secret to an unintended destination; it doesn't require re-approval
+  for routine, already-established automation.
+- **Vault directory permissions**: the vault directory's ACL is reset to grant
+  only the current user (by SID) and SYSTEM, removing any broader inherited
+  access. This is defense in depth — DPAPI encryption is what actually
+  protects the values even if another local account could read the file.
 - **Generation**: secrets are produced with a CSPRNG
   (`RandomNumberGenerator`), never by asking a language model to invent
   entropy.
@@ -69,12 +84,14 @@ secretctl capture     -Name <n> [-Force] -- <command> [args...]
 secretctl set         -Name <n> [-Force]                      (interactive humans only)
 secretctl import-file -Name <n> -Path <file> [-Delete] [-Force]
 secretctl list
-secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|file:<path>
-                       [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name]
+secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|wrangler:worker-name|file:<path>
+                       [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name] [-Cwd dir]
 secretctl run          [-Name <n> [-As ENV_VAR]] [-Env ENV_VAR=VaultName ...] -- <command> [args...]
 secretctl rotate      -Name <n> [-RepushAll]
 secretctl delete      -Name <n> [-Force]
 secretctl reveal      -Name <n>                                (interactive humans only)
+secretctl allow       -Name <n> -Target <target-spec>          (interactive humans only)
+secretctl audit-verify
 ```
 
 ### Example: generate a secret and push it to GitHub Actions and Vercel
@@ -86,6 +103,19 @@ secretctl push -Name STRIPE_WEBHOOK_SECRET -Target vercel:acme-api -VercelEnv pr
 ```
 
 At no point does the value appear in either command's output.
+
+### Example: push a secret to a Cloudflare Worker
+
+```
+secretctl push -Name GATEWAY_SHARED_SECRET -Target wrangler:forge-gateway
+```
+
+Pipes the value into `wrangler secret put`'s stdin, same pattern as the
+other targets. `wrangler`'s non-interactive mode silently answers "yes" to
+its own "there's no Worker called X, create one?" prompt, so a typo'd
+worker name would otherwise create a brand-new empty Worker instead of
+failing loudly (confirmed the hard way while building this) — `push`
+checks the Worker already exists first and refuses if it doesn't.
 
 ### Example: capture a token another CLI already generated
 
