@@ -84,8 +84,8 @@ secretctl capture     -Name <n> [-Force] -- <command> [args...]
 secretctl set         -Name <n> [-Force]                      (interactive humans only)
 secretctl import-file -Name <n> -Path <file> [-Delete] [-Force]
 secretctl list
-secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|file:<path>
-                       [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name]
+secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|wrangler:worker-name|file:<path>
+                       [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name] [-Cwd dir]
 secretctl run          [-Name <n> [-As ENV_VAR]] [-Env ENV_VAR=VaultName ...] -- <command> [args...]
 secretctl rotate      -Name <n> [-RepushAll]
 secretctl delete      -Name <n> [-Force]
@@ -103,6 +103,19 @@ secretctl push -Name STRIPE_WEBHOOK_SECRET -Target vercel:acme-api -VercelEnv pr
 ```
 
 At no point does the value appear in either command's output.
+
+### Example: push a secret to a Cloudflare Worker
+
+```
+secretctl push -Name GATEWAY_SHARED_SECRET -Target wrangler:forge-gateway
+```
+
+Pipes the value into `wrangler secret put`'s stdin, same pattern as the
+other targets. `wrangler`'s non-interactive mode silently answers "yes" to
+its own "there's no Worker called X, create one?" prompt, so a typo'd
+worker name would otherwise create a brand-new empty Worker instead of
+failing loudly (confirmed the hard way while building this) — `push`
+checks the Worker already exists first and refuses if it doesn't.
 
 ### Example: capture a token another CLI already generated
 

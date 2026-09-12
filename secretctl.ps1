@@ -401,6 +401,24 @@ function Push-ToFile([string]$plain, [string]$path, [string]$envName) {
     }
 }
 
+function Push-ToWrangler([string]$plain, [string]$workerName, [string]$envName, [string]$cwd) {
+    # wrangler's non-interactive fallback silently answers "yes" to its own
+    # "there's no Worker called X, create one?" prompt - a typo'd worker name
+    # would otherwise create a brand-new empty Worker and push the secret
+    # there instead of failing loudly (confirmed: it really did this in
+    # testing). Refuse up front unless the named Worker already exists.
+    $listArgs = @('secret', 'list', '--name', $workerName)
+    if ($cwd) { $listArgs += @('--cwd', $cwd) }
+    & wrangler @listArgs *>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "Worker '$workerName' does not appear to exist (or wrangler isn't logged into the right account). Refusing to push - wrangler would otherwise silently create a new empty Worker for a typo'd name. Run 'wrangler deploy' first if this is meant to be a new Worker."
+    }
+    $wArgs = @('secret', 'put', $envName, '--name', $workerName)
+    if ($cwd) { $wArgs += @('--cwd', $cwd) }
+    $plain | wrangler @wArgs
+    if ($LASTEXITCODE -ne 0) { Write-Error "wrangler secret put failed with exit code $LASTEXITCODE" }
+}
+
 function Assert-TargetAllowed([hashtable]$vault, [string]$Name, [string]$Target) {
     $entry = $vault[$Name]
     $allowed = @($entry.allowedTargets) + @($entry.pushedTo | ForEach-Object { $_.target })
@@ -449,9 +467,10 @@ function Cmd-Push([string[]]$rest) {
     $RepoEnv   = Get-Named $rest '-RepoEnv'
     $VercelEnv = Get-Named $rest '-VercelEnv' 'production'
     $Project   = Get-Named $rest '-Project'
+    $Cwd       = Get-Named $rest '-Cwd'
 
     if (-not $Name -or -not $Target) {
-        Write-Error "Usage: secretctl push -Name <name> -Target github:owner/repo|vercel[:project]|file:<path> [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name]"
+        Write-Error "Usage: secretctl push -Name <name> -Target github:owner/repo|vercel[:project]|wrangler:worker-name|file:<path> [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name] [-Cwd dir]"
     }
 
     $vault = Load-Vault
@@ -474,6 +493,12 @@ function Cmd-Push([string[]]$rest) {
             $pushRecord = @{ target = $Target; envName = $EnvName; vercelEnv = $VercelEnv; project = $proj }
             $desc = "vercel" + $(if ($proj) { ":$proj" } else { " (linked project)" }) + " [$VercelEnv] as $EnvName"
         }
+        elseif ($Target -match '^wrangler:(.+)$') {
+            $workerName = $Matches[1]
+            Push-ToWrangler -plain $plain -workerName $workerName -envName $EnvName -cwd $Cwd
+            $pushRecord = @{ target = $Target; envName = $EnvName; cwd = $Cwd }
+            $desc = "wrangler:$workerName as $EnvName"
+        }
         elseif ($Target -match '^file:(.+)$') {
             $path = $Matches[1]
             Push-ToFile -plain $plain -path $path -envName $EnvName
@@ -481,7 +506,7 @@ function Cmd-Push([string[]]$rest) {
             $desc = "file:$path as $EnvName"
         }
         else {
-            Write-Error "Unrecognized -Target '$Target'. Use github:owner/repo, vercel[:project], or file:<path>."
+            Write-Error "Unrecognized -Target '$Target'. Use github:owner/repo, vercel[:project], wrangler:worker-name, or file:<path>."
         }
     }
     finally {
@@ -524,6 +549,7 @@ function Cmd-Rotate([string[]]$rest) {
             if ($p.repoEnv)   { $pushArgs += @('-RepoEnv', $p.repoEnv) }
             if ($p.vercelEnv) { $pushArgs += @('-VercelEnv', $p.vercelEnv) }
             if ($p.project)   { $pushArgs += @('-Project', $p.project) }
+            if ($p.cwd)       { $pushArgs += @('-Cwd', $p.cwd) }
             Cmd-Push $pushArgs
         }
     }
@@ -638,7 +664,7 @@ secretctl - local blind secret broker (values never printed to agent-visible out
   secretctl set         -Name <n> [-Force]                      (interactive humans only)
   secretctl import-file -Name <n> -Path <file> [-Delete] [-Force]
   secretctl list
-  secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|file:<path> [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name]
+  secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|wrangler:worker-name|file:<path> [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name] [-Cwd dir]
   secretctl run         [-Name <n> [-As ENV_VAR]] [-Env ENV_VAR=VaultName ...] -- <command> [args...]
   secretctl rotate      -Name <n> [-RepushAll]
   secretctl delete      -Name <n> [-Force]
