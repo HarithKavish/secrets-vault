@@ -27,11 +27,21 @@ runs the same way from PowerShell, `cmd`, or a POSIX shell (Git Bash/WSL):
 - `secretctl` — POSIX shim (Git Bash resolves bare `secretctl`)
 
 Every subcommand emits only a masked preview (`********ab12`) or a
-success/failure line. Two subcommands are the deliberate exception —
-`set` and `reveal` — and both hard-refuse the moment they detect
-non-interactive or redirected input, which is always true when an agent
-calls them. They exist purely for a human to run themselves, in their own
-terminal.
+success/failure line to its own output — including `reveal`, which delivers
+the value via the clipboard instead of printing it, specifically so it stays
+safe to call from an agent.
+
+**Every verb is callable by any agent.** Nothing is gated on "is a human
+typing in this terminal" — that was the original design and it's gone. What
+gates the sensitive verbs (`reveal`, `allow`, the first push to a new
+destination, `delete`) is **Windows Hello**: a real fingerprint/PIN prompt,
+a separate OS-level surface from this process's console, so an agent can
+trigger the request but only a physically present human with an enrolled
+credential can satisfy it — no typing required on either side. See
+[Windows Hello approval](#windows-hello-approval) below. `set` is the one
+exception that's still human-only, and for a structurally different reason:
+it's data entry (typing the actual secret value in), not a yes/no decision,
+and no biometric prompt can substitute for that.
 
 ## How it works
 
@@ -45,10 +55,8 @@ terminal.
   editing or deleting a past line breaks the chain; `secretctl audit-verify`
   walks the whole log and reports the first broken link.
 - **Destination allow-list**: a secret can only be pushed to a target it has
-  already been pushed to, or one approved via `secretctl allow`. The first
-  push to any new target always requires an interactive human to confirm it —
-  it fails closed exactly like `reveal`/`set` for a non-interactive caller —
-  then that target is remembered for that secret going forward. This is what
+  already been pushed to, or one approved via `secretctl allow` or a Windows
+  Hello prompt triggered by the first push to a new target. This is what
   stops a manipulated or mistaken agent instruction from silently redirecting
   a real secret to an unintended destination; it doesn't require re-approval
   for routine, already-established automation.
@@ -76,21 +84,61 @@ terminal.
   message (a malformed-connection-string exception, a verbose driver log)
   never actually leaks it to whatever is reading the command's output.
 
+## Windows Hello approval
+
+Four things require approval before they happen: **`reveal`**, **`allow`**,
+the **first push to a target a secret hasn't used before**, and **`delete`**
+(unless `-Force`). Approval works the same way for all four:
+
+1. secretctl calls `Windows.Security.Credentials.UI.UserConsentVerifier`
+   (via a disposable Windows PowerShell 5.1 subprocess — pwsh 7 can't
+   resolve WinRT types directly) and asks for verification, with a message
+   naming exactly what's being approved (e.g. *"secretctl: approve pushing
+   'DATABASE_URL' to new destination 'github:acme/api'?"*).
+2. Windows shows its native Hello prompt — fingerprint, face, or PIN,
+   whichever you've enrolled — **regardless of whether the process that
+   triggered it is interactive**. This is the load-bearing property: an
+   agent's tool call runs with redirected/null stdin, so it can never answer
+   a console prompt, but Hello isn't a console prompt — it's a separate
+   OS-level surface tied to hardware-backed credentials, so the agent can
+   *trigger* the request without being able to *satisfy* it.
+3. Only an explicit `Verified` result approves the action. Denied, canceled,
+   timed out, or any other outcome refuses it outright — there's no retry
+   with a weaker method.
+4. If Windows Hello isn't configured on this machine at all,
+   `CheckAvailabilityAsync` reports that up front and secretctl falls back
+   to the original typed-confirmation gate (type the secret's name back) —
+   which still only works for a genuinely interactive human, so an agent's
+   call still fails closed even without Hello available.
+
+**`reveal` specifically** also had to change *how* it delivers the value.
+Windows Hello proves a human is present, but it doesn't create a channel for
+delivering a value that bypasses the calling process's own output stream —
+and that output stream is exactly what an agent's tool call reads back into
+its own context. So `reveal` copies the value to the **clipboard** instead
+of printing it, and starts a detached background process that clears the
+clipboard after 45 seconds *if it still contains that same value* (compared
+by hash, so something else you copied in the meantime isn't wiped).
+secretctl's own output after a successful `reveal` is only ever a status
+line — the value never appears in anything an agent reads.
+
+`set` does not go through this — see above for why.
+
 ## Usage
 
 ```
 secretctl generate    -Name <n> [-Length 32] [-Charset alnum|hex|base64url|numeric] [-Force]
 secretctl capture     -Name <n> [-Force] -- <command> [args...]
-secretctl set         -Name <n> [-Force]                      (interactive humans only)
+secretctl set         -Name <n> [-Force]                      (human types the value - no approval prompt applies)
 secretctl import-file -Name <n> -Path <file> [-Delete] [-Force]
 secretctl list
 secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|wrangler:worker-name|file:<path>
                        [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name] [-Cwd dir]
 secretctl run          [-Name <n> [-As ENV_VAR]] [-Env ENV_VAR=VaultName ...] -- <command> [args...]
 secretctl rotate      -Name <n> [-RepushAll]
-secretctl delete      -Name <n> [-Force]
-secretctl reveal      -Name <n>                                (interactive humans only)
-secretctl allow       -Name <n> -Target <target-spec>          (interactive humans only)
+secretctl delete      -Name <n> [-Force]                      (Windows Hello approval, or -Force to skip)
+secretctl reveal      -Name <n>                                (Windows Hello approval; copies to clipboard, never printed)
+secretctl allow       -Name <n> -Target <target-spec>          (Windows Hello approval)
 secretctl audit-verify
 ```
 
@@ -148,12 +196,23 @@ depends on (`ConvertFrom-Json -AsHashtable`, `RandomNumberGenerator.Fill`).
 
 ## Guidance for agents
 
-- Never call `reveal`, and never attempt to supply a value to `set` on a
-  user's behalf — both are designed to fail closed for you, by design.
+- Call whatever verb the task actually needs, including `reveal`, `allow`,
+  and `delete` — they're gated by a Windows Hello prompt the user has to
+  physically approve, not by whether you're allowed to ask. Asking is fine;
+  the gate is the point, not something to route around by finding a verb
+  that skips it.
+- Never attempt to supply a value to `set` on the user's behalf — it exists
+  specifically for a human to type a value you don't and shouldn't know.
+  There's no approval flow that substitutes for this; if a task needs it,
+  tell the user to run `secretctl set -Name X` themselves.
 - If a task needs a secret's plaintext to exist somewhere (a `.env` file, a
   cloud provider's secret store), use `generate` / `capture` / `import-file`
-  followed by `push`. If manual entry or a human actually looking at a value
-  is genuinely required, tell the user to run `set` or `reveal` themselves.
+  followed by `push` — you never need to see the value to do this.
+- Don't spam approval requests. Each Windows Hello prompt interrupts the
+  user physically; batch what you can (e.g. `rotate -RepushAll` re-pushes to
+  every already-approved target in one call instead of one `push` per
+  target), and don't retry a declined/timed-out request without a good
+  reason to think the user's answer would change.
 
 ## Known limitations
 
@@ -166,3 +225,13 @@ depends on (`ConvertFrom-Json -AsHashtable`, `RandomNumberGenerator.Fill`).
 - In-process plaintext (briefly held as a .NET string while pushing or
   generating) cannot be reliably zeroed from memory. Accepted residual risk
   for a local tool; not a vector by which an agent can read the value.
+- Windows Hello approval requires an interactive desktop session (it's a GUI
+  prompt) and Windows PowerShell 5.1 to still be present on the machine
+  alongside pwsh 7 (used only for the WinRT interop call). Without either,
+  approval falls back to typed console confirmation, which only works for a
+  genuinely interactive human — an agent's call still fails closed either way.
+- `reveal`'s clipboard delivery means the value briefly sits in the OS
+  clipboard, readable by anything else running as this user that polls the
+  clipboard, for up to 45 seconds (or until overwritten). This is the
+  accepted tradeoff for making `reveal` agent-triggerable without ever
+  putting the value in an agent-readable output stream.
