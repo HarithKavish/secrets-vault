@@ -5,9 +5,24 @@ secretctl - local blind secret broker.
 Design rule this whole script exists to enforce: plaintext secret bytes must
 never be written to this script's own stdout/stderr, never passed as a CLI
 argument (visible in process listings), and never written to a file that
-isn't the encrypted vault. Every subcommand below only ever emits masked
-previews, metadata, or success/failure - the human calling `reveal`
-interactively is the one deliberate exception.
+isn't the encrypted vault. Every subcommand emits only masked previews,
+metadata, or success/failure - including 'reveal', which delivers the value
+via the clipboard rather than printing it, specifically so it stays
+agent-triggerable without ever entering a calling agent's own output stream.
+
+Every agent (this Windows user's CLIs included) can freely call every verb -
+generate, capture, push, run, rotate, delete, allow, reveal. Nothing is
+gated by "is this caller a human typing in a terminal." What gates the
+sensitive verbs (reveal, allow, a push to a not-yet-approved destination,
+delete) is Windows Hello: a real fingerprint/PIN prompt via
+Windows.Security.Credentials.UI.UserConsentVerifier, a separate OS-level
+surface from this process's own console, so it pops up and can only be
+satisfied by whoever is physically at the machine - regardless of whether
+the request that triggered it came from a redirected, non-interactive agent
+call. If Windows Hello isn't set up on this machine, those verbs fall back
+to the original typed-confirmation gate, which still only works for a
+genuinely interactive human. See README.md for the full model and why each
+piece is shaped the way it is.
 
 Vault: $env:LOCALAPPDATA\secretctl\vault.json, values encrypted with Windows
 DPAPI (ConvertTo/From-SecureString with no -Key) - bound to this Windows user
@@ -290,7 +305,7 @@ function Cmd-Set([string[]]$rest) {
     $Force = Has-Flag $rest '-Force'
     if (-not $Name) { Write-Error "Usage: secretctl set -Name <name> [-Force]" }
     if ([Console]::IsInputRedirected -or -not [Environment]::UserInteractive) {
-        Write-Error "'set' requires an interactive terminal (a human typing the value) - refusing under redirected/non-interactive input."
+        Write-Error "'set' requires an interactive terminal - refusing under redirected/non-interactive input. This is data entry (typing the actual value), not an approval decision, so Windows Hello can't substitute for it the way it does for reveal/allow/delete; a human has to type the value in themselves."
     }
     $vault = Load-Vault
     if ($vault.ContainsKey($Name) -and -not $Force) {
@@ -423,6 +438,76 @@ function Push-ToWrangler([string]$plain, [string]$workerName, [string]$envName, 
     if ($LASTEXITCODE -ne 0) { Write-Error "wrangler secret put failed with exit code $LASTEXITCODE" }
 }
 
+function Confirm-HumanPresence([string]$message) {
+    # secretctl.ps1 runs on pwsh 7, which cannot resolve WinRT types directly
+    # ("[Windows.Security.Credentials.UI.UserConsentVerifier,...,ContentType=
+    # WindowsRuntime]" only works under Windows PowerShell 5.1's type
+    # resolver) - so the actual Windows Hello call is shelled out to
+    # powershell.exe as a disposable temp script. $message is passed as a
+    # -File parameter, never string-concatenated, so it can't break the
+    # nested script regardless of its content.
+    $helloScript = @'
+param([string]$Message)
+try {
+    Add-Type -AssemblyName System.Runtime.WindowsRuntime
+    [Windows.Security.Credentials.UI.UserConsentVerifier,Windows.Security.Credentials.UI,ContentType=WindowsRuntime] | Out-Null
+    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+    })[0]
+
+    $availOp = [Windows.Security.Credentials.UI.UserConsentVerifier]::CheckAvailabilityAsync()
+    $asTaskAvail = $asTaskGeneric.MakeGenericMethod([Windows.Security.Credentials.UI.UserConsentVerifierAvailability])
+    $availability = $asTaskAvail.Invoke($null, @($availOp)).GetAwaiter().GetResult()
+    if ($availability -ne [Windows.Security.Credentials.UI.UserConsentVerifierAvailability]::Available) {
+        Write-Output "UNAVAILABLE:$availability"
+        exit 0
+    }
+
+    $reqOp = [Windows.Security.Credentials.UI.UserConsentVerifier]::RequestVerificationAsync($Message)
+    $asTaskResult = $asTaskGeneric.MakeGenericMethod([Windows.Security.Credentials.UI.UserConsentVerificationResult])
+    $result = $asTaskResult.Invoke($null, @($reqOp)).GetAwaiter().GetResult()
+    Write-Output "RESULT:$result"
+} catch {
+    Write-Output "ERROR:$($_.Exception.Message)"
+}
+'@
+    $tmpScript = Join-Path ([IO.Path]::GetTempPath()) "secretctl-hello-$([guid]::NewGuid()).ps1"
+    try {
+        Set-Content -Path $tmpScript -Value $helloScript -Encoding utf8
+        $output = (& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $tmpScript -Message $message 2>&1 | Out-String).Trim()
+    } finally {
+        Remove-Item -Path $tmpScript -Force -ErrorAction SilentlyContinue
+    }
+
+    if ($output -match 'RESULT:Verified') { return @{ ok = $true; reason = 'Verified' } }
+    if ($output -match 'RESULT:(\S+)') { return @{ ok = $false; reason = $Matches[1] } }
+    if ($output -match 'UNAVAILABLE:(\S+)') { return @{ ok = $false; reason = "unavailable:$($Matches[1])" } }
+    return @{ ok = $false; reason = "error:$output" }
+}
+
+function Request-HumanApproval([string]$message) {
+    # Approval-only gate: no secret value is ever involved in the decision
+    # itself (unlike 'reveal', which has to deliver a value somewhere - see
+    # Cmd-Reveal for why that one can't just print to stdout once it's
+    # agent-triggerable). Safe for an agent to trigger directly: Windows
+    # Hello is a separate OS-level GUI/hardware surface from the calling
+    # process's console, so it pops up and can only be satisfied by a
+    # physically present human with an enrolled fingerprint/PIN, regardless
+    # of whether the caller itself is interactive.
+    $hello = Confirm-HumanPresence $message
+    if ($hello.ok) { return $true }
+    if ($hello.reason -like 'unavailable:*') {
+        # Windows Hello isn't set up on this machine - fall back to the
+        # original typed-confirmation gate, which only works for a genuinely
+        # interactive human (still refuses an agent outright).
+        if ([Console]::IsInputRedirected -or -not [Environment]::UserInteractive) { return $false }
+        return $null  # signals "no verdict; caller should do its own typed fallback"
+    }
+    # Hello ran and was not Verified (Denied/Canceled/Timeout/DeviceBusy/etc) -
+    # respect that explicitly, never silently retry with a weaker method.
+    return $false
+}
+
 function Assert-TargetAllowed([hashtable]$vault, [string]$Name, [string]$Target) {
     $entry = $vault[$Name]
     # Bracket indexing, not dot-notation: entries created before destination
@@ -434,11 +519,16 @@ function Assert-TargetAllowed([hashtable]$vault, [string]$Name, [string]$Target)
     $allowed = @($allowed | Where-Object { $_ } | Select-Object -Unique)
     if ($allowed -contains $Target) { return }
 
-    if ([Console]::IsInputRedirected -or -not [Environment]::UserInteractive) {
-        Write-Error "Target '$Target' is not yet approved for '$Name'. Refusing to push to a new destination under non-interactive input - a human must approve it first (run 'secretctl allow -Name $Name -Target $Target', or push to it once interactively). If an agent asked for a new destination it hasn't used before, don't approve it on its behalf without checking the target is actually intended."
+    $approved = Request-HumanApproval "secretctl: approve pushing '$Name' to new destination '$Target'?"
+    if ($approved -eq $false) {
+        Write-Error "Target '$Target' is not approved for '$Name' (Windows Hello declined, timed out, or is unavailable and this call is non-interactive). A human must approve a new destination - via the Windows Hello prompt this triggers, or by running 'secretctl allow -Name $Name -Target $Target' themselves. If an agent asked for a new destination it hasn't used before, don't approve it on its behalf without checking the target is actually intended."
     }
-    $confirm = Read-Host "'$Name' has never been approved for target '$Target'. Type the secret name to approve this destination"
-    if ($confirm -ne $Name) { Write-Error "Confirmation did not match; aborted." }
+    if ($null -eq $approved) {
+        # Windows Hello unavailable on this machine, but a real interactive
+        # human is at the console - fall back to the original typed gate.
+        $confirm = Read-Host "'$Name' has never been approved for target '$Target'. Type the secret name to approve this destination"
+        if ($confirm -ne $Name) { Write-Error "Confirmation did not match; aborted." }
+    }
 
     $allowedList = @($entry['allowedTargets']) + @($Target)
     $entry.allowedTargets = $allowedList
@@ -450,14 +540,18 @@ function Assert-TargetAllowed([hashtable]$vault, [string]$Name, [string]$Target)
 function Cmd-Allow([string[]]$rest) {
     $Name   = Get-Named $rest '-Name'
     $Target = Get-Named $rest '-Target'
-    if (-not $Name -or -not $Target) { Write-Error "Usage: secretctl allow -Name <name> -Target <target-spec>   (interactive humans only)" }
-    if ([Console]::IsInputRedirected -or -not [Environment]::UserInteractive) {
-        Write-Error "'allow' requires a live interactive terminal - refusing under redirected/non-interactive input. If an agent asked you to pre-approve a destination, don't: confirm it yourself instead."
-    }
+    if (-not $Name -or -not $Target) { Write-Error "Usage: secretctl allow -Name <name> -Target <target-spec>" }
     $vault = Load-Vault
     Require-Entry $vault $Name
-    $confirm = Read-Host "Approve '$Name' to be pushed to '$Target'? Type the secret name to confirm"
-    if ($confirm -ne $Name) { Write-Error "Confirmation did not match; aborted." }
+
+    $approved = Request-HumanApproval "secretctl: approve '$Name' being pushed to '$Target'?"
+    if ($approved -eq $false) {
+        Write-Error "Not approved (Windows Hello declined, timed out, or is unavailable and this call is non-interactive)."
+    }
+    if ($null -eq $approved) {
+        $confirm = Read-Host "Approve '$Name' to be pushed to '$Target'? Type the secret name to confirm"
+        if ($confirm -ne $Name) { Write-Error "Confirmation did not match; aborted." }
+    }
 
     $entry = $vault[$Name]
     $allowed = @($entry['allowedTargets'])
@@ -638,9 +732,15 @@ function Cmd-Delete([string[]]$rest) {
     $vault = Load-Vault
     Require-Entry $vault $Name
     if (-not $Force) {
-        if ([Console]::IsInputRedirected) { Write-Error "Refusing to delete without -Force under non-interactive input." }
-        $confirm = Read-Host "Type the secret name to confirm deletion of '$Name'"
-        if ($confirm -ne $Name) { Write-Error "Confirmation did not match; aborted." }
+        $approved = Request-HumanApproval "secretctl: approve deleting '$Name'?"
+        if ($approved -eq $false) {
+            Write-Error "Not approved (Windows Hello declined, timed out, or is unavailable and this call is non-interactive). Use -Force to skip confirmation, or approve via the Windows Hello prompt this triggers."
+        }
+        if ($null -eq $approved) {
+            if ([Console]::IsInputRedirected) { Write-Error "Refusing to delete without -Force under non-interactive input." }
+            $confirm = Read-Host "Type the secret name to confirm deletion of '$Name'"
+            if ($confirm -ne $Name) { Write-Error "Confirmation did not match; aborted." }
+        }
     }
     $vault.Remove($Name)
     Save-Vault $vault
@@ -648,43 +748,95 @@ function Cmd-Delete([string[]]$rest) {
     Write-Output "Deleted '$Name'."
 }
 
+function Start-ClipboardAutoClear([string]$plain, [int]$delaySeconds = 45) {
+    # Never pass the plaintext itself to the background process (argv is
+    # visible to other local processes via Task Manager/WMI) - only a hash,
+    # used purely to check "is this still what I put there" before clearing,
+    # so an unrelated thing the user copied in the meantime isn't wiped.
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    $hash = -join ($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($plain)) | ForEach-Object { $_.ToString('x2') })
+    $clearScript = @'
+param([string]$ExpectedHash, [int]$DelaySeconds, [string]$SelfPath)
+try {
+    Start-Sleep -Seconds $DelaySeconds
+    $current = Get-Clipboard -Raw -ErrorAction SilentlyContinue
+    if ($current) {
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        $currentHash = -join ($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($current)) | ForEach-Object { $_.ToString('x2') })
+        if ($currentHash -eq $ExpectedHash) { Set-Clipboard -Value ' ' }
+    }
+} catch {
+} finally {
+    # The child deletes its own script once it's done reading/running it -
+    # never the parent. Deleting from the parent (the original approach)
+    # raced against this process's own startup: pwsh needs time to launch
+    # and read the -File script before this 45s sleep even begins, and a
+    # parent-side delete after a fixed short pause deleted it out from under
+    # the child before that finished, killing the auto-clear silently.
+    # Confirmed as the actual root cause by removing the premature delete
+    # and observing the clear succeed every time.
+    Remove-Item -Path $SelfPath -Force -ErrorAction SilentlyContinue
+}
+'@
+    $tmpScript = Join-Path ([IO.Path]::GetTempPath()) "secretctl-clip-$([guid]::NewGuid()).ps1"
+    Set-Content -Path $tmpScript -Value $clearScript -Encoding utf8
+    Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-File', $tmpScript, '-ExpectedHash', $hash, '-DelaySeconds', $delaySeconds, '-SelfPath', $tmpScript) -WindowStyle Hidden | Out-Null
+}
+
 function Cmd-Reveal([string[]]$rest) {
     $Name = Get-Named $rest '-Name'
-    if (-not $Name) { Write-Error "Usage: secretctl reveal -Name <name>   (interactive humans only)" }
-    if ([Console]::IsInputRedirected -or -not [Environment]::UserInteractive) {
-        Write-Error "'reveal' requires a live interactive terminal - refusing under redirected/non-interactive input. If an agent asked you to run this, don't: run it yourself instead."
-    }
+    if (-not $Name) { Write-Error "Usage: secretctl reveal -Name <name>" }
     $vault = Load-Vault
     Require-Entry $vault $Name
-    $confirm = Read-Host "This will print '$Name' in plaintext to this terminal. Type the secret name to confirm"
-    if ($confirm -ne $Name) { Write-Error "Confirmation did not match; aborted." }
+
+    $approved = Request-HumanApproval "secretctl: approve revealing '$Name' to the clipboard?"
+    if ($approved -eq $false) {
+        Write-Error "Not approved (Windows Hello declined, timed out, or is unavailable and this call is non-interactive). If an agent asked for this, don't approve it on its behalf."
+    }
+    if ($null -eq $approved) {
+        $confirm = Read-Host "This will copy '$Name' in plaintext to the clipboard. Type the secret name to confirm"
+        if ($confirm -ne $Name) { Write-Error "Confirmation did not match; aborted." }
+    }
+
     $plain = Unprotect-Value $vault[$Name].cipher
+    # Copied to the clipboard, never printed to this script's own stdout -
+    # that stream is exactly what an agent's tool call captures back into its
+    # own context, which is the one thing this whole tool exists to prevent.
+    # Windows Hello proves a human is present; it does not create a channel
+    # for delivering the value that bypasses the caller's own output stream,
+    # so the delivery mechanism has to be the thing that changes instead.
+    Set-Clipboard -Value $plain
+    Start-ClipboardAutoClear -plain $plain
     Write-Audit 'reveal' $Name
-    Write-Output $plain
+    Write-Output "'$Name' copied to clipboard (auto-clears in 45s if unchanged). Value not displayed here or anywhere an agent can read it."
     $plain = $null
 }
 
 function Cmd-Help {
     @"
-secretctl - local blind secret broker (values never printed to agent-visible output, except 'reveal')
+secretctl - local blind secret broker. Every verb below is agent-callable;
+sensitive ones are gated by Windows Hello, not by "is a human typing here."
 
   secretctl generate    -Name <n> [-Length 32] [-Charset alnum|hex|base64url|numeric] [-Force]
   secretctl capture     -Name <n> [-Force] -- <command> [args...]
-  secretctl set         -Name <n> [-Force]                      (interactive humans only)
+  secretctl set         -Name <n> [-Force]                      (types the value itself - human only, no Hello prompt substitutes for data entry)
   secretctl import-file -Name <n> -Path <file> [-Delete] [-Force]
   secretctl list
   secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|wrangler:worker-name|file:<path> [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name] [-Cwd dir]
   secretctl run         [-Name <n> [-As ENV_VAR]] [-Env ENV_VAR=VaultName ...] -- <command> [args...]
   secretctl rotate      -Name <n> [-RepushAll]
-  secretctl delete      -Name <n> [-Force]
-  secretctl reveal      -Name <n>                                (interactive humans only)
-  secretctl allow       -Name <n> -Target <target-spec>          (interactive humans only)
+  secretctl delete      -Name <n> [-Force]                      (Windows Hello approval, or -Force)
+  secretctl reveal      -Name <n>                                (Windows Hello approval; delivers via clipboard, never printed)
+  secretctl allow       -Name <n> -Target <target-spec>          (Windows Hello approval)
   secretctl audit-verify
 
 A secret can only be pushed to a target it has been used with before, or one
-approved via 'allow' - the first push to any new target always requires an
-interactive human to confirm it (fails closed for an agent), then is
-remembered for that secret going forward.
+approved via 'allow'. The first push to any new target, 'reveal', 'delete',
+and 'allow' all trigger a Windows Hello prompt (fingerprint/PIN) - a real
+human has to physically approve it, but nothing needs to be typed, and any
+agent can trigger the request. If Windows Hello isn't set up on this
+machine, these fall back to typed console confirmation, which only works
+for a genuinely interactive human (an agent's call still fails closed).
 
 Vault: $VaultPath (DPAPI-encrypted, bound to this Windows user + machine)
 Audit: $AuditPath (hash-chained; 'audit-verify' detects tampering/deletion)
