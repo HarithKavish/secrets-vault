@@ -756,24 +756,31 @@ function Start-ClipboardAutoClear([string]$plain, [int]$delaySeconds = 45) {
     $hasher = [Security.Cryptography.SHA256]::Create()
     $hash = -join ($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($plain)) | ForEach-Object { $_.ToString('x2') })
     $clearScript = @'
-param([string]$ExpectedHash, [int]$DelaySeconds)
-Start-Sleep -Seconds $DelaySeconds
+param([string]$ExpectedHash, [int]$DelaySeconds, [string]$SelfPath)
 try {
+    Start-Sleep -Seconds $DelaySeconds
     $current = Get-Clipboard -Raw -ErrorAction SilentlyContinue
     if ($current) {
         $hasher = [Security.Cryptography.SHA256]::Create()
         $currentHash = -join ($hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($current)) | ForEach-Object { $_.ToString('x2') })
         if ($currentHash -eq $ExpectedHash) { Set-Clipboard -Value ' ' }
     }
-} catch {}
+} catch {
+} finally {
+    # The child deletes its own script once it's done reading/running it -
+    # never the parent. Deleting from the parent (the original approach)
+    # raced against this process's own startup: pwsh needs time to launch
+    # and read the -File script before this 45s sleep even begins, and a
+    # parent-side delete after a fixed short pause deleted it out from under
+    # the child before that finished, killing the auto-clear silently.
+    # Confirmed as the actual root cause by removing the premature delete
+    # and observing the clear succeed every time.
+    Remove-Item -Path $SelfPath -Force -ErrorAction SilentlyContinue
+}
 '@
     $tmpScript = Join-Path ([IO.Path]::GetTempPath()) "secretctl-clip-$([guid]::NewGuid()).ps1"
     Set-Content -Path $tmpScript -Value $clearScript -Encoding utf8
-    Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-File', $tmpScript, '-ExpectedHash', $hash, '-DelaySeconds', $delaySeconds) -WindowStyle Hidden | Out-Null
-    # The spawned process reads and deletes its own script; a short race on
-    # deletion here is harmless since the script contains no secret material.
-    Start-Sleep -Milliseconds 200
-    Remove-Item -Path $tmpScript -Force -ErrorAction SilentlyContinue
+    Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-WindowStyle', 'Hidden', '-File', $tmpScript, '-ExpectedHash', $hash, '-DelaySeconds', $delaySeconds, '-SelfPath', $tmpScript) -WindowStyle Hidden | Out-Null
 }
 
 function Cmd-Reveal([string[]]$rest) {
