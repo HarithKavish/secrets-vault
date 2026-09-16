@@ -474,6 +474,74 @@ function Cmd-List([string[]]$rest) {
     $rows | Format-Table -AutoSize | Out-String -Width 200 | Write-Output
 }
 
+function Cmd-ScanEnv([string[]]$rest) {
+    $Scope   = Get-Named $rest '-Scope' 'Both'
+    $Pattern = Get-Named $rest '-Pattern'
+    $scopes = switch ($Scope) {
+        'User'    { @('User') }
+        'Machine' { @('Machine') }
+        'Both'    { @('User', 'Machine') }
+        default   { Write-Error "Invalid -Scope '$Scope'. Use User, Machine, or Both." }
+    }
+    # Heuristic on the NAME only - never the value. Not exhaustive (a secret
+    # named oddly won't be flagged) and not proof (e.g. TOKENIZER_PATH would
+    # false-positive on TOKEN) - it's a starting point for a human/agent to
+    # look at, not a verdict.
+    $secretHeuristic = '(KEY|SECRET|TOKEN|PASS(WORD)?|PWD|CREDENTIAL|AUTH|APIKEY|CONN(ECTION)?STR|DSN|CERT|PRIVATE|CLIENT_SECRET|ACCESS_KEY|URI|URL)'
+
+    $rows = foreach ($sc in $scopes) {
+        $vars = [Environment]::GetEnvironmentVariables($sc)
+        foreach ($key in ($vars.Keys | Sort-Object)) {
+            if ($Pattern -and $key -notmatch $Pattern) { continue }
+            $val = $vars[$key]
+            [pscustomobject]@{
+                Name        = $key
+                Scope       = $sc
+                Length      = if ($val) { $val.Length } else { 0 }
+                LooksSecret = if ($key -match $secretHeuristic) { 'YES' } else { '' }
+            }
+        }
+    }
+    if (@($rows).Count -eq 0) { Write-Output "(no matching environment variables)"; return }
+    $rows | Sort-Object @{Expression = 'LooksSecret'; Descending = $true }, Scope, Name |
+        Format-Table -AutoSize | Out-String -Width 200 | Write-Output
+    Write-Output "Names and lengths only - values are never shown here. To vault one blind:"
+    Write-Output "  secretctl capture -Name <vaultName> -- pwsh -NoProfile -Command `"[Environment]::GetEnvironmentVariable('<VarName>','<Scope>')`""
+}
+
+function Cmd-ClearEnvVar([string[]]$rest) {
+    $EnvVarNames = @(Get-AllNamed $rest '-EnvVar')
+    $Scope       = Get-Named $rest '-Scope'
+    if ($EnvVarNames.Count -eq 0 -or $Scope -notin @('User', 'Machine')) {
+        Write-Error "Usage: secretctl clear-env -EnvVar <name> [-EnvVar <name> ...] -Scope User|Machine"
+    }
+    $namesList = $EnvVarNames -join ', '
+
+    # Accepts multiple -EnvVar for exactly one Windows Hello prompt covering
+    # the whole batch - each prompt is a real physical interruption, so a
+    # cleanup of several variables at once shouldn't cost one tap per name.
+    $approved = Request-HumanApproval "secretctl: approve removing $($EnvVarNames.Count) variable(s) from $Scope environment variables: $namesList? (Make sure each is safely captured into the vault first.)"
+    if ($approved -eq $false) {
+        Write-Error "Not approved (Windows Hello declined, timed out, or is unavailable and this call is non-interactive)."
+    }
+    if ($null -eq $approved) {
+        $confirm = Read-Host "Type 'yes' to confirm removing $($EnvVarNames.Count) variable(s) ($namesList) from $Scope environment variables"
+        if ($confirm -ne 'yes') { Write-Error "Confirmation did not match; aborted." }
+    }
+
+    # [Environment]::SetEnvironmentVariable($name, $null, scope) does NOT
+    # delete the registry value on this system - confirmed by testing: it
+    # left an empty string behind instead of removing the value entirely.
+    # The secret's content is gone either way, but that's not the same as
+    # actually removing the variable, so go straight to the registry.
+    $regPath = if ($Scope -eq 'User') { 'HKCU:\Environment' } else { 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' }
+    foreach ($name in $EnvVarNames) {
+        Remove-ItemProperty -Path $regPath -Name $name -ErrorAction SilentlyContinue
+        Write-Audit 'clear-env' $name $Scope
+    }
+    Write-Output "Removed $($EnvVarNames.Count) variable(s) from $Scope environment variables (registry values deleted): $namesList. Already-running processes (including this shell) keep their existing copies in memory until restarted, and other running apps won't see the change until they restart either - Windows itself works the same way."
+}
+
 function Push-ToGithub([string]$plain, [string]$ownerRepo, [string]$envName, [string]$repoEnv) {
     $ghArgs = @('secret', 'set', $envName, '--repo', $ownerRepo)
     if ($repoEnv) { $ghArgs += @('--env', $repoEnv) }
@@ -553,10 +621,75 @@ try {
         exit 0
     }
 
+    # A background/non-focused process's Windows Hello prompt can end up
+    # behind other windows or minimized on the taskbar instead of popping to
+    # the front - confirmed as a real, reported problem, not theoretical.
+    # Tried forcing this process's own console window to the foreground
+    # first, but GetConsoleWindow() returns zero here (this process is
+    # launched with no console window at all in this execution context, e.g.
+    # via redirected-output process creation) - confirmed by direct testing,
+    # so there is no window of ours to force. Instead: snapshot the set of
+    # visible top-level windows before requesting verification, then poll
+    # briefly for whatever NEW window appears once the request is issued
+    # (the dialog itself, whatever it turns out to be titled/classed as) and
+    # force that one to the foreground - robust to not knowing the exact
+    # title Windows uses for this dialog on a given version.
+    Add-Type @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public class SecretctlWin32 {
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool FlashWindow(IntPtr hWnd, bool bInvert);
+
+    public static List<IntPtr> GetVisibleWindows() {
+        var list = new List<IntPtr>();
+        EnumWindows((hWnd, lParam) => {
+            if (IsWindowVisible(hWnd) && GetWindowTextLength(hWnd) > 0) { list.Add(hWnd); }
+            return true;
+        }, IntPtr.Zero);
+        return list;
+    }
+
+    public static string GetTitle(IntPtr hWnd) {
+        int len = GetWindowTextLength(hWnd);
+        var sb = new StringBuilder(len + 1);
+        GetWindowText(hWnd, sb, sb.Capacity);
+        return sb.ToString();
+    }
+}
+"@
+    $before = [SecretctlWin32]::GetVisibleWindows()
+
     $reqOp = [Windows.Security.Credentials.UI.UserConsentVerifier]::RequestVerificationAsync($Message)
+
+    $forcedTitles = @()
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 150
+        $after = [SecretctlWin32]::GetVisibleWindows()
+        $newWindows = $after | Where-Object { $before -notcontains $_ }
+        if ($newWindows.Count -gt 0) {
+            foreach ($w in $newWindows) {
+                [SecretctlWin32]::ShowWindow($w, 9) | Out-Null   # SW_RESTORE
+                [SecretctlWin32]::SetForegroundWindow($w) | Out-Null
+                [SecretctlWin32]::FlashWindow($w, $true) | Out-Null
+                $forcedTitles += [SecretctlWin32]::GetTitle($w)
+            }
+            break
+        }
+    }
+
     $asTaskResult = $asTaskGeneric.MakeGenericMethod([Windows.Security.Credentials.UI.UserConsentVerificationResult])
     $result = $asTaskResult.Invoke($null, @($reqOp)).GetAwaiter().GetResult()
     Write-Output "RESULT:$result"
+    Write-Output "FORCED_WINDOWS:$($forcedTitles -join '|')"
 } catch {
     Write-Output "ERROR:$($_.Exception.Message)"
 }
@@ -914,6 +1047,8 @@ sensitive ones are gated by Windows Hello, not by "is a human typing here."
   secretctl cf-list-permission-groups -BootstrapName <vaultName> [-AccountId <id>]
   secretctl cf-create-token -Name <n> -BootstrapName <vaultName> [-TokenName <cf-name>] (-PolicyJson <json> | -PolicyFile <path>) [-Force]
   secretctl list
+  secretctl scan-env     [-Scope User|Machine|Both] [-Pattern <regex>]
+  secretctl clear-env    -EnvVar <name> -Scope User|Machine          (Windows Hello approval)
   secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|wrangler:worker-name|file:<path> [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name] [-Cwd dir]
   secretctl run         [-Name <n> [-As ENV_VAR]] [-Env ENV_VAR=VaultName ...] -- <command> [args...]
   secretctl rotate      -Name <n> [-RepushAll]
@@ -940,6 +1075,12 @@ up the exact permission group IDs for whatever policy the new token needs
 (e.g. Workers script edit) - don't guess at IDs, Cloudflare's taxonomy can
 change. See README.md for a worked example.
 
+'scan-env' lists environment variable NAMES (User/Machine scope) with a
+length and a name-based "looks like a secret" heuristic - never values.
+Use it to find candidates, then vault one blind with 'capture' (see its
+own output for the exact command), then optionally 'clear-env' to remove
+the now-duplicated plaintext original.
+
 Vault: $VaultPath (DPAPI-encrypted, bound to this Windows user + machine)
 Audit: $AuditPath (hash-chained; 'audit-verify' detects tampering/deletion)
 "@ | Write-Output
@@ -957,6 +1098,8 @@ switch ($verb) {
     'cf-list-permission-groups' { Cmd-CfListPermissionGroups $rest }
     'cf-create-token'           { Cmd-CfCreateToken $rest }
     'list'         { Cmd-List $rest }
+    'scan-env'     { Cmd-ScanEnv $rest }
+    'clear-env'    { Cmd-ClearEnvVar $rest }
     'push'         { Cmd-Push $rest }
     'run'          { Cmd-Run $rest }
     'rotate'       { Cmd-Rotate $rest }
