@@ -189,6 +189,14 @@ original:
 secretctl clear-env -EnvVar MONGODB_URI -Scope User
 ```
 
+`clear-env` accepts multiple `-EnvVar` flags for exactly one Windows Hello
+prompt covering the whole batch — cleaning up several forgotten secrets at
+once shouldn't cost one physical tap per name:
+
+```
+secretctl clear-env -EnvVar MONGODB_URI -EnvVar REDIS_URI -EnvVar RENDER_API_KEY -Scope User
+```
+
 `clear-env` is Windows Hello-gated like `delete`/`reveal`/`allow` — removing
 a variable other tools might depend on is exactly the kind of action that
 deserves a human's physical approval, not a plain agent decision. It also
@@ -211,7 +219,7 @@ secretctl cf-list-permission-groups -BootstrapName <vaultName> [-AccountId <id>]
 secretctl cf-create-token -Name <n> -BootstrapName <vaultName> [-TokenName <cf-name>] (-PolicyJson <json> | -PolicyFile <path>) [-Force]
 secretctl list
 secretctl scan-env     [-Scope User|Machine|Both] [-Pattern <regex>]
-secretctl clear-env    -EnvVar <name> -Scope User|Machine          (Windows Hello approval)
+secretctl clear-env    -EnvVar <name> [-EnvVar <name> ...] -Scope User|Machine   (Windows Hello approval)
 secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|wrangler:worker-name|file:<path>
                        [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name] [-Cwd dir]
 secretctl run          [-Name <n> [-As ENV_VAR]] [-Env ENV_VAR=VaultName ...] -- <command> [args...]

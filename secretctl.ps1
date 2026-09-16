@@ -510,19 +510,23 @@ function Cmd-ScanEnv([string[]]$rest) {
 }
 
 function Cmd-ClearEnvVar([string[]]$rest) {
-    $EnvVarName = Get-Named $rest '-EnvVar'
-    $Scope      = Get-Named $rest '-Scope'
-    if (-not $EnvVarName -or $Scope -notin @('User', 'Machine')) {
-        Write-Error "Usage: secretctl clear-env -EnvVar <name> -Scope User|Machine"
+    $EnvVarNames = @(Get-AllNamed $rest '-EnvVar')
+    $Scope       = Get-Named $rest '-Scope'
+    if ($EnvVarNames.Count -eq 0 -or $Scope -notin @('User', 'Machine')) {
+        Write-Error "Usage: secretctl clear-env -EnvVar <name> [-EnvVar <name> ...] -Scope User|Machine"
     }
+    $namesList = $EnvVarNames -join ', '
 
-    $approved = Request-HumanApproval "secretctl: approve removing '$EnvVarName' from $Scope environment variables? (Make sure its value is safely captured into the vault first.)"
+    # Accepts multiple -EnvVar for exactly one Windows Hello prompt covering
+    # the whole batch - each prompt is a real physical interruption, so a
+    # cleanup of several variables at once shouldn't cost one tap per name.
+    $approved = Request-HumanApproval "secretctl: approve removing $($EnvVarNames.Count) variable(s) from $Scope environment variables: $namesList? (Make sure each is safely captured into the vault first.)"
     if ($approved -eq $false) {
         Write-Error "Not approved (Windows Hello declined, timed out, or is unavailable and this call is non-interactive)."
     }
     if ($null -eq $approved) {
-        $confirm = Read-Host "Type the variable name to confirm removing '$EnvVarName' from $Scope environment variables"
-        if ($confirm -ne $EnvVarName) { Write-Error "Confirmation did not match; aborted." }
+        $confirm = Read-Host "Type 'yes' to confirm removing $($EnvVarNames.Count) variable(s) ($namesList) from $Scope environment variables"
+        if ($confirm -ne 'yes') { Write-Error "Confirmation did not match; aborted." }
     }
 
     # [Environment]::SetEnvironmentVariable($name, $null, scope) does NOT
@@ -531,9 +535,11 @@ function Cmd-ClearEnvVar([string[]]$rest) {
     # The secret's content is gone either way, but that's not the same as
     # actually removing the variable, so go straight to the registry.
     $regPath = if ($Scope -eq 'User') { 'HKCU:\Environment' } else { 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' }
-    Remove-ItemProperty -Path $regPath -Name $EnvVarName -ErrorAction SilentlyContinue
-    Write-Audit 'clear-env' $EnvVarName $Scope
-    Write-Output "Removed '$EnvVarName' from $Scope environment variables (registry value deleted). Already-running processes (including this shell) keep their existing copy in memory until restarted, and other running apps won't see the change until they restart either - Windows itself works the same way."
+    foreach ($name in $EnvVarNames) {
+        Remove-ItemProperty -Path $regPath -Name $name -ErrorAction SilentlyContinue
+        Write-Audit 'clear-env' $name $Scope
+    }
+    Write-Output "Removed $($EnvVarNames.Count) variable(s) from $Scope environment variables (registry values deleted): $namesList. Already-running processes (including this shell) keep their existing copies in memory until restarted, and other running apps won't see the change until they restart either - Windows itself works the same way."
 }
 
 function Push-ToGithub([string]$plain, [string]$ownerRepo, [string]$envName, [string]$repoEnv) {
