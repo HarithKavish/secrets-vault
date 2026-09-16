@@ -474,6 +474,68 @@ function Cmd-List([string[]]$rest) {
     $rows | Format-Table -AutoSize | Out-String -Width 200 | Write-Output
 }
 
+function Cmd-ScanEnv([string[]]$rest) {
+    $Scope   = Get-Named $rest '-Scope' 'Both'
+    $Pattern = Get-Named $rest '-Pattern'
+    $scopes = switch ($Scope) {
+        'User'    { @('User') }
+        'Machine' { @('Machine') }
+        'Both'    { @('User', 'Machine') }
+        default   { Write-Error "Invalid -Scope '$Scope'. Use User, Machine, or Both." }
+    }
+    # Heuristic on the NAME only - never the value. Not exhaustive (a secret
+    # named oddly won't be flagged) and not proof (e.g. TOKENIZER_PATH would
+    # false-positive on TOKEN) - it's a starting point for a human/agent to
+    # look at, not a verdict.
+    $secretHeuristic = '(KEY|SECRET|TOKEN|PASS(WORD)?|PWD|CREDENTIAL|AUTH|APIKEY|CONN(ECTION)?STR|DSN|CERT|PRIVATE|CLIENT_SECRET|ACCESS_KEY|URI|URL)'
+
+    $rows = foreach ($sc in $scopes) {
+        $vars = [Environment]::GetEnvironmentVariables($sc)
+        foreach ($key in ($vars.Keys | Sort-Object)) {
+            if ($Pattern -and $key -notmatch $Pattern) { continue }
+            $val = $vars[$key]
+            [pscustomobject]@{
+                Name        = $key
+                Scope       = $sc
+                Length      = if ($val) { $val.Length } else { 0 }
+                LooksSecret = if ($key -match $secretHeuristic) { 'YES' } else { '' }
+            }
+        }
+    }
+    if (@($rows).Count -eq 0) { Write-Output "(no matching environment variables)"; return }
+    $rows | Sort-Object @{Expression = 'LooksSecret'; Descending = $true }, Scope, Name |
+        Format-Table -AutoSize | Out-String -Width 200 | Write-Output
+    Write-Output "Names and lengths only - values are never shown here. To vault one blind:"
+    Write-Output "  secretctl capture -Name <vaultName> -- pwsh -NoProfile -Command `"[Environment]::GetEnvironmentVariable('<VarName>','<Scope>')`""
+}
+
+function Cmd-ClearEnvVar([string[]]$rest) {
+    $EnvVarName = Get-Named $rest '-EnvVar'
+    $Scope      = Get-Named $rest '-Scope'
+    if (-not $EnvVarName -or $Scope -notin @('User', 'Machine')) {
+        Write-Error "Usage: secretctl clear-env -EnvVar <name> -Scope User|Machine"
+    }
+
+    $approved = Request-HumanApproval "secretctl: approve removing '$EnvVarName' from $Scope environment variables? (Make sure its value is safely captured into the vault first.)"
+    if ($approved -eq $false) {
+        Write-Error "Not approved (Windows Hello declined, timed out, or is unavailable and this call is non-interactive)."
+    }
+    if ($null -eq $approved) {
+        $confirm = Read-Host "Type the variable name to confirm removing '$EnvVarName' from $Scope environment variables"
+        if ($confirm -ne $EnvVarName) { Write-Error "Confirmation did not match; aborted." }
+    }
+
+    # [Environment]::SetEnvironmentVariable($name, $null, scope) does NOT
+    # delete the registry value on this system - confirmed by testing: it
+    # left an empty string behind instead of removing the value entirely.
+    # The secret's content is gone either way, but that's not the same as
+    # actually removing the variable, so go straight to the registry.
+    $regPath = if ($Scope -eq 'User') { 'HKCU:\Environment' } else { 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' }
+    Remove-ItemProperty -Path $regPath -Name $EnvVarName -ErrorAction SilentlyContinue
+    Write-Audit 'clear-env' $EnvVarName $Scope
+    Write-Output "Removed '$EnvVarName' from $Scope environment variables (registry value deleted). Already-running processes (including this shell) keep their existing copy in memory until restarted, and other running apps won't see the change until they restart either - Windows itself works the same way."
+}
+
 function Push-ToGithub([string]$plain, [string]$ownerRepo, [string]$envName, [string]$repoEnv) {
     $ghArgs = @('secret', 'set', $envName, '--repo', $ownerRepo)
     if ($repoEnv) { $ghArgs += @('--env', $repoEnv) }
@@ -914,6 +976,8 @@ sensitive ones are gated by Windows Hello, not by "is a human typing here."
   secretctl cf-list-permission-groups -BootstrapName <vaultName> [-AccountId <id>]
   secretctl cf-create-token -Name <n> -BootstrapName <vaultName> [-TokenName <cf-name>] (-PolicyJson <json> | -PolicyFile <path>) [-Force]
   secretctl list
+  secretctl scan-env     [-Scope User|Machine|Both] [-Pattern <regex>]
+  secretctl clear-env    -EnvVar <name> -Scope User|Machine          (Windows Hello approval)
   secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|wrangler:worker-name|file:<path> [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name] [-Cwd dir]
   secretctl run         [-Name <n> [-As ENV_VAR]] [-Env ENV_VAR=VaultName ...] -- <command> [args...]
   secretctl rotate      -Name <n> [-RepushAll]
@@ -940,6 +1004,12 @@ up the exact permission group IDs for whatever policy the new token needs
 (e.g. Workers script edit) - don't guess at IDs, Cloudflare's taxonomy can
 change. See README.md for a worked example.
 
+'scan-env' lists environment variable NAMES (User/Machine scope) with a
+length and a name-based "looks like a secret" heuristic - never values.
+Use it to find candidates, then vault one blind with 'capture' (see its
+own output for the exact command), then optionally 'clear-env' to remove
+the now-duplicated plaintext original.
+
 Vault: $VaultPath (DPAPI-encrypted, bound to this Windows user + machine)
 Audit: $AuditPath (hash-chained; 'audit-verify' detects tampering/deletion)
 "@ | Write-Output
@@ -957,6 +1027,8 @@ switch ($verb) {
     'cf-list-permission-groups' { Cmd-CfListPermissionGroups $rest }
     'cf-create-token'           { Cmd-CfCreateToken $rest }
     'list'         { Cmd-List $rest }
+    'scan-env'     { Cmd-ScanEnv $rest }
+    'clear-env'    { Cmd-ClearEnvVar $rest }
     'push'         { Cmd-Push $rest }
     'run'          { Cmd-Run $rest }
     'rotate'       { Cmd-Rotate $rest }
