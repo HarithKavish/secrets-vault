@@ -124,6 +124,36 @@ line — the value never appears in anything an agent reads.
 
 `set` does not go through this — see above for why.
 
+## Generating Cloudflare API tokens
+
+`cf-create-token` mints a new, narrowly-scoped Cloudflare API token via
+Cloudflare's own REST API (`POST /user/tokens`) and stores the result
+directly in the vault — an agent never sees the value, same as everything
+else here. But minting a token requires *another* token with permission to
+create tokens, so there's a one-time human bootstrap step that can't be
+automated away (the same category as `wrangler login`/`gh auth login`
+elsewhere in this repo):
+
+1. In the Cloudflare dashboard → My Profile → API Tokens → Create Token →
+   Custom Token, grant only **User → API Tokens → Edit**. This is
+   deliberately narrower than the Global API Key (which Cloudflare itself
+   discourages) — it can create/edit/delete tokens and nothing else.
+2. Capture it once: `secretctl set -Name CF_TOKEN_BOOTSTRAP`.
+3. From then on, minting any new scoped token is a blind CLI command. Look
+   up the exact permission group IDs first — don't guess at them, Cloudflare's
+   taxonomy isn't guaranteed stable:
+   ```
+   secretctl cf-list-permission-groups -BootstrapName CF_TOKEN_BOOTSTRAP -AccountId <account-id>
+   ```
+4. Build a policy from the IDs that came back and create the token:
+   ```
+   secretctl cf-create-token -Name MY_PROJECT_CF_TOKEN -BootstrapName CF_TOKEN_BOOTSTRAP -TokenName "my-project-ci" -PolicyJson '[{"effect":"allow","resources":{"com.cloudflare.api.account.<account-id>":"*"},"permission_groups":[{"id":"<id-from-step-3>"}]}]'
+   ```
+
+The bootstrap token itself is just another vault entry — it's protected the
+same way as everything else (DPAPI, audit-logged, Windows Hello gates
+`reveal`/`delete` on it same as any secret).
+
 ## Usage
 
 ```
@@ -131,6 +161,8 @@ secretctl generate    -Name <n> [-Length 32] [-Charset alnum|hex|base64url|numer
 secretctl capture     -Name <n> [-Force] -- <command> [args...]
 secretctl set         -Name <n> [-Force]                      (human types the value - no approval prompt applies)
 secretctl import-file -Name <n> -Path <file> [-Delete] [-Force]
+secretctl cf-list-permission-groups -BootstrapName <vaultName> [-AccountId <id>]
+secretctl cf-create-token -Name <n> -BootstrapName <vaultName> [-TokenName <cf-name>] (-PolicyJson <json> | -PolicyFile <path>) [-Force]
 secretctl list
 secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|wrangler:worker-name|file:<path>
                        [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name] [-Cwd dir]
@@ -213,6 +245,10 @@ depends on (`ConvertFrom-Json -AsHashtable`, `RandomNumberGenerator.Fill`).
   every already-approved target in one call instead of one `push` per
   target), and don't retry a declined/timed-out request without a good
   reason to think the user's answer would change.
+- Before `cf-create-token`, always run `cf-list-permission-groups` against
+  the actual account first — don't construct a policy from remembered or
+  guessed permission group IDs. Cloudflare's IDs are account/product-specific
+  and not something to hardcode from training data or a past project.
 
 ## Known limitations
 
