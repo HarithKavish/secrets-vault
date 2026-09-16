@@ -367,6 +367,96 @@ function Cmd-ImportFile([string[]]$rest) {
     Write-Output "Imported '$Name' from file ($((Load-Vault)[$Name].length) chars)$(if($Delete){' - source file deleted'}). Preview: $((Load-Vault)[$Name].preview)"
 }
 
+function Invoke-CloudflareApi([string]$Method, [string]$Path, [string]$BootstrapToken, $Body = $null) {
+    $headers = @{ Authorization = "Bearer $BootstrapToken" }
+    $uri = "https://api.cloudflare.com/client/v4$Path"
+    try {
+        if ($null -ne $Body) {
+            $resp = Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -ContentType 'application/json' -Body ($Body | ConvertTo-Json -Depth 10)
+        } else {
+            $resp = Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers
+        }
+    } catch {
+        $detail = $_.ErrorDetails.Message
+        if ($detail) { Write-Error "Cloudflare API request failed: $detail" }
+        else { Write-Error "Cloudflare API request failed: $_" }
+    }
+    if (-not $resp.success) {
+        $errMsg = ($resp.errors | ForEach-Object { $_.message }) -join '; '
+        Write-Error "Cloudflare API returned an error: $errMsg"
+    }
+    return $resp.result
+}
+
+function Cmd-CfListPermissionGroups([string[]]$rest) {
+    $BootstrapName = Get-Named $rest '-BootstrapName'
+    $AccountId     = Get-Named $rest '-AccountId'
+    if (-not $BootstrapName) {
+        Write-Error "Usage: secretctl cf-list-permission-groups -BootstrapName <vaultName> [-AccountId <id>]"
+    }
+    $vault = Load-Vault
+    Require-Entry $vault $BootstrapName
+    $token = Unprotect-Value $vault[$BootstrapName].cipher
+    try {
+        $path = if ($AccountId) { "/accounts/$AccountId/tokens/permission_groups" } else { '/user/tokens/permission_groups' }
+        $groups = Invoke-CloudflareApi -Method 'Get' -Path $path -BootstrapToken $token
+    } finally {
+        $token = $null
+    }
+    $groups | Select-Object id, name | Sort-Object name | Format-Table -AutoSize | Out-String -Width 200 | Write-Output
+}
+
+function Cmd-CfCreateToken([string[]]$rest) {
+    $Name          = Get-Named $rest '-Name'
+    $BootstrapName = Get-Named $rest '-BootstrapName'
+    $TokenName     = Get-Named $rest '-TokenName' $Name
+    $PolicyJson    = Get-Named $rest '-PolicyJson'
+    $PolicyFile    = Get-Named $rest '-PolicyFile'
+    $Force         = Has-Flag $rest '-Force'
+    if (-not $Name -or -not $BootstrapName -or (-not $PolicyJson -and -not $PolicyFile)) {
+        Write-Error "Usage: secretctl cf-create-token -Name <vaultName> -BootstrapName <bootstrapVaultName> [-TokenName <cf-token-name>] (-PolicyJson <json> | -PolicyFile <path>) [-Force]"
+    }
+
+    $vault = Load-Vault
+    Require-Entry $vault $BootstrapName
+    if ($vault.ContainsKey($Name) -and -not $Force) {
+        Write-Error "Secret '$Name' already exists. Use -Force to overwrite."
+    }
+
+    $policyText = if ($PolicyFile) { Get-Content -Path $PolicyFile -Raw } else { $PolicyJson }
+    $policies = $policyText | ConvertFrom-Json
+
+    $bootstrapToken = Unprotect-Value $vault[$BootstrapName].cipher
+    $newTokenValue = $null
+    try {
+        $body = @{ name = $TokenName; policies = $policies }
+        $result = Invoke-CloudflareApi -Method 'Post' -Path '/user/tokens' -BootstrapToken $bootstrapToken -Body $body
+        $newTokenValue = $result.value
+    } finally {
+        $bootstrapToken = $null
+    }
+    if ([string]::IsNullOrEmpty($newTokenValue)) {
+        Write-Error "Cloudflare did not return a token value - the token may still have been created on their side under the name '$TokenName'; check the dashboard before retrying to avoid an orphaned token."
+    }
+
+    $now = (Get-Date).ToUniversalTime().ToString('o')
+    $vault[$Name] = @{
+        cipher         = (Protect-Value $newTokenValue)
+        created        = if ($vault.ContainsKey($Name)) { $vault[$Name].created } else { $now }
+        updated        = $now
+        length         = $newTokenValue.Length
+        charset        = 'cloudflare-token'
+        preview        = Get-Preview $newTokenValue
+        source         = "cf-create-token:$TokenName"
+        pushedTo       = @()
+        allowedTargets = @()
+    }
+    Save-Vault $vault
+    Write-Audit 'cf-create-token' $Name
+    $newTokenValue = $null
+    Write-Output "Created Cloudflare API token '$TokenName' and stored as '$Name'. Preview: $((Load-Vault)[$Name].preview)"
+}
+
 function Cmd-List([string[]]$rest) {
     $vault = Load-Vault
     if ($vault.Count -eq 0) { Write-Output "(vault is empty)"; return }
@@ -821,6 +911,8 @@ sensitive ones are gated by Windows Hello, not by "is a human typing here."
   secretctl capture     -Name <n> [-Force] -- <command> [args...]
   secretctl set         -Name <n> [-Force]                      (types the value itself - human only, no Hello prompt substitutes for data entry)
   secretctl import-file -Name <n> -Path <file> [-Delete] [-Force]
+  secretctl cf-list-permission-groups -BootstrapName <vaultName> [-AccountId <id>]
+  secretctl cf-create-token -Name <n> -BootstrapName <vaultName> [-TokenName <cf-name>] (-PolicyJson <json> | -PolicyFile <path>) [-Force]
   secretctl list
   secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|wrangler:worker-name|file:<path> [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name] [-Cwd dir]
   secretctl run         [-Name <n> [-As ENV_VAR]] [-Env ENV_VAR=VaultName ...] -- <command> [args...]
@@ -838,6 +930,16 @@ agent can trigger the request. If Windows Hello isn't set up on this
 machine, these fall back to typed console confirmation, which only works
 for a genuinely interactive human (an agent's call still fails closed).
 
+'cf-create-token' mints a new, narrowly-scoped Cloudflare API token via
+Cloudflare's own REST API and stores it directly in the vault, blind - but
+needs a one-time human bootstrap first: a Cloudflare API token with the
+"User > API Tokens > Edit" permission, captured once via 'secretctl set',
+since creating a token requires an existing token with permission to create
+tokens. Use 'cf-list-permission-groups' with that bootstrap token to look
+up the exact permission group IDs for whatever policy the new token needs
+(e.g. Workers script edit) - don't guess at IDs, Cloudflare's taxonomy can
+change. See README.md for a worked example.
+
 Vault: $VaultPath (DPAPI-encrypted, bound to this Windows user + machine)
 Audit: $AuditPath (hash-chained; 'audit-verify' detects tampering/deletion)
 "@ | Write-Output
@@ -852,6 +954,8 @@ switch ($verb) {
     'capture'      { Cmd-Capture $rest }
     'set'          { Cmd-Set $rest }
     'import-file'  { Cmd-ImportFile $rest }
+    'cf-list-permission-groups' { Cmd-CfListPermissionGroups $rest }
+    'cf-create-token'           { Cmd-CfCreateToken $rest }
     'list'         { Cmd-List $rest }
     'push'         { Cmd-Push $rest }
     'run'          { Cmd-Run $rest }
