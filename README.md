@@ -124,6 +124,23 @@ line — the value never appears in anything an agent reads.
 
 `set` does not go through this — see above for why.
 
+**Getting the prompt to actually appear in front of you** turned out to need
+its own fix. Reported in practice: the Hello prompt would appear minimized
+in the background instead of popping to the front, so it was easy to
+trigger a request and never notice it was waiting. The first fix attempt
+(force this process's own console window to the foreground before asking)
+didn't apply here — `GetConsoleWindow()` returns zero in this execution
+context, confirmed by direct testing, meaning there's no window of ours to
+force in the first place. The actual fix: snapshot every visible top-level
+window before calling `RequestVerificationAsync`, then poll briefly for
+whatever *new* window appears once the request is issued (found to be
+titled "Windows Security", though the code doesn't hardcode that — it
+detects it as a diff, robust to the exact title changing across Windows
+versions) and force that one to the foreground and flash it. Verified live,
+twice, including once with a fullscreen video playing over everything else
+on screen — the prompt still came to the front both times.
+
+
 ## Generating Cloudflare API tokens
 
 `cf-create-token` mints a new, narrowly-scoped Cloudflare API token via

@@ -621,10 +621,75 @@ try {
         exit 0
     }
 
+    # A background/non-focused process's Windows Hello prompt can end up
+    # behind other windows or minimized on the taskbar instead of popping to
+    # the front - confirmed as a real, reported problem, not theoretical.
+    # Tried forcing this process's own console window to the foreground
+    # first, but GetConsoleWindow() returns zero here (this process is
+    # launched with no console window at all in this execution context, e.g.
+    # via redirected-output process creation) - confirmed by direct testing,
+    # so there is no window of ours to force. Instead: snapshot the set of
+    # visible top-level windows before requesting verification, then poll
+    # briefly for whatever NEW window appears once the request is issued
+    # (the dialog itself, whatever it turns out to be titled/classed as) and
+    # force that one to the foreground - robust to not knowing the exact
+    # title Windows uses for this dialog on a given version.
+    Add-Type @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+public class SecretctlWin32 {
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern int GetWindowTextLength(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool FlashWindow(IntPtr hWnd, bool bInvert);
+
+    public static List<IntPtr> GetVisibleWindows() {
+        var list = new List<IntPtr>();
+        EnumWindows((hWnd, lParam) => {
+            if (IsWindowVisible(hWnd) && GetWindowTextLength(hWnd) > 0) { list.Add(hWnd); }
+            return true;
+        }, IntPtr.Zero);
+        return list;
+    }
+
+    public static string GetTitle(IntPtr hWnd) {
+        int len = GetWindowTextLength(hWnd);
+        var sb = new StringBuilder(len + 1);
+        GetWindowText(hWnd, sb, sb.Capacity);
+        return sb.ToString();
+    }
+}
+"@
+    $before = [SecretctlWin32]::GetVisibleWindows()
+
     $reqOp = [Windows.Security.Credentials.UI.UserConsentVerifier]::RequestVerificationAsync($Message)
+
+    $forcedTitles = @()
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 150
+        $after = [SecretctlWin32]::GetVisibleWindows()
+        $newWindows = $after | Where-Object { $before -notcontains $_ }
+        if ($newWindows.Count -gt 0) {
+            foreach ($w in $newWindows) {
+                [SecretctlWin32]::ShowWindow($w, 9) | Out-Null   # SW_RESTORE
+                [SecretctlWin32]::SetForegroundWindow($w) | Out-Null
+                [SecretctlWin32]::FlashWindow($w, $true) | Out-Null
+                $forcedTitles += [SecretctlWin32]::GetTitle($w)
+            }
+            break
+        }
+    }
+
     $asTaskResult = $asTaskGeneric.MakeGenericMethod([Windows.Security.Credentials.UI.UserConsentVerificationResult])
     $result = $asTaskResult.Invoke($null, @($reqOp)).GetAwaiter().GetResult()
     Write-Output "RESULT:$result"
+    Write-Output "FORCED_WINDOWS:$($forcedTitles -join '|')"
 } catch {
     Write-Output "ERROR:$($_.Exception.Message)"
 }
