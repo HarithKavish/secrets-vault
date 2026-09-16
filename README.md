@@ -124,6 +124,23 @@ line — the value never appears in anything an agent reads.
 
 `set` does not go through this — see above for why.
 
+**Getting the prompt to actually appear in front of you** turned out to need
+its own fix. Reported in practice: the Hello prompt would appear minimized
+in the background instead of popping to the front, so it was easy to
+trigger a request and never notice it was waiting. The first fix attempt
+(force this process's own console window to the foreground before asking)
+didn't apply here — `GetConsoleWindow()` returns zero in this execution
+context, confirmed by direct testing, meaning there's no window of ours to
+force in the first place. The actual fix: snapshot every visible top-level
+window before calling `RequestVerificationAsync`, then poll briefly for
+whatever *new* window appears once the request is issued (found to be
+titled "Windows Security", though the code doesn't hardcode that — it
+detects it as a diff, robust to the exact title changing across Windows
+versions) and force that one to the foreground and flash it. Verified live,
+twice, including once with a fullscreen video playing over everything else
+on screen — the prompt still came to the front both times.
+
+
 ## Generating Cloudflare API tokens
 
 `cf-create-token` mints a new, narrowly-scoped Cloudflare API token via
@@ -154,6 +171,60 @@ The bootstrap token itself is just another vault entry — it's protected the
 same way as everything else (DPAPI, audit-logged, Windows Hello gates
 `reveal`/`delete` on it same as any secret).
 
+## Finding secrets already sitting in plaintext environment variables
+
+It's common for people to paste an API key or connection string into a
+User or System environment variable years ago and forget about it. `scan-env`
+finds those candidates without ever exposing a value — the fundamental
+split this needs is: an agent (or human) can safely look at variable
+*names*, but must never look at *values* to decide what's worth vaulting.
+
+```
+secretctl scan-env -Scope Both
+```
+
+lists every User/Machine environment variable with its length and a
+name-based heuristic flag (`KEY`, `SECRET`, `TOKEN`, `PASSWORD`, `URI`,
+`URL`, etc.) — never the value. The heuristic is a starting point, not a
+verdict: it can both miss real secrets with unusual names and flag
+harmless ones (a `DOCS_URL` matches `URL` too). A live scan on the machine
+this was built on immediately found five real, forgotten credentials
+sitting in plaintext `User` variables (Mongo/Redis connection strings, two
+API keys) that had never been through this vault.
+
+To vault a candidate blind, no new command is needed — `capture` already
+does this generically:
+
+```
+secretctl capture -Name MONGODB_URI -- pwsh -NoProfile -Command "[Environment]::GetEnvironmentVariable('MONGODB_URI','User')"
+```
+
+Then, once it's safely in the vault, clean up the now-duplicated plaintext
+original:
+
+```
+secretctl clear-env -EnvVar MONGODB_URI -Scope User
+```
+
+`clear-env` accepts multiple `-EnvVar` flags for exactly one Windows Hello
+prompt covering the whole batch — cleaning up several forgotten secrets at
+once shouldn't cost one physical tap per name:
+
+```
+secretctl clear-env -EnvVar MONGODB_URI -EnvVar REDIS_URI -EnvVar RENDER_API_KEY -Scope User
+```
+
+`clear-env` is Windows Hello-gated like `delete`/`reveal`/`allow` — removing
+a variable other tools might depend on is exactly the kind of action that
+deserves a human's physical approval, not a plain agent decision. It also
+deletes the registry value outright rather than blanking it: `[Environment]
+::SetEnvironmentVariable($name, $null, 'User')` was tried first and
+confirmed (by testing, not assumption) to leave an empty-string value
+behind instead of actually removing it — fixed by going straight to
+`HKCU:\Environment` / `HKLM:\...\Session Manager\Environment`. Either way,
+already-running processes keep their existing copy in memory until
+restarted, same as any Windows environment variable change.
+
 ## Usage
 
 ```
@@ -164,6 +235,8 @@ secretctl import-file -Name <n> -Path <file> [-Delete] [-Force]
 secretctl cf-list-permission-groups -BootstrapName <vaultName> [-AccountId <id>]
 secretctl cf-create-token -Name <n> -BootstrapName <vaultName> [-TokenName <cf-name>] (-PolicyJson <json> | -PolicyFile <path>) [-Force]
 secretctl list
+secretctl scan-env     [-Scope User|Machine|Both] [-Pattern <regex>]
+secretctl clear-env    -EnvVar <name> [-EnvVar <name> ...] -Scope User|Machine   (Windows Hello approval)
 secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|wrangler:worker-name|file:<path>
                        [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name] [-Cwd dir]
 secretctl run          [-Name <n> [-As ENV_VAR]] [-Env ENV_VAR=VaultName ...] -- <command> [args...]
