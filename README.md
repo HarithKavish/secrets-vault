@@ -43,6 +43,71 @@ exception that's still human-only, and for a structurally different reason:
 it's data entry (typing the actual secret value in), not a yes/no decision,
 and no biometric prompt can substitute for that.
 
+## Threat model — what this actually stops, and what it doesn't
+
+Be precise about the boundary, because it's easy to overstate: **Windows
+Hello gates secretctl's own code path, not the encrypted data itself.**
+`vault.json` is protected by DPAPI, bound to this Windows user + machine —
+that's the actual security boundary. Any process running as this user can
+decrypt it directly (`ConvertTo-SecureString` / `Marshal.SecureStringToBSTR`,
+the same two calls this script uses) without ever going through
+`secretctl.ps1` or triggering a single Hello prompt. A compromised
+dependency, a malicious postinstall script, another agent, anything with
+local code execution as this account, bypasses every verb-level gate here
+completely — because the gate is a property of *this script's* code path,
+not of the ciphertext.
+
+What that means concretely: this tool's actual, tested guarantee is that a
+**well-behaved agent calling secretctl as documented** never has plaintext
+land in its own context — through generation, capture, push, or run,
+including through a downstream error message. That is a real, load-bearing
+property and it holds up. It does **not** defend against a machine already
+compromised at the level of "arbitrary code running as you" — at that point
+the actual protection is DPAPI plus the strength of the Windows account
+itself, not anything secretctl adds on top. Treat every Windows Hello gate
+in this tool as raising the bar for a well-intentioned caller doing the
+wrong thing, not as a barrier against a genuinely hostile one with local
+code execution.
+
+A few more limits worth being explicit about, so they don't read as implied
+guarantees:
+
+- **`run`'s output redaction is a literal string-replace** against the exact
+  plaintext plus a couple of known transforms (URL-encoded, base64). It
+  reliably catches a value echoed back verbatim or in one of those forms —
+  it does not catch hex, truncation, case changes, or a child process
+  writing the value to a file or over the network instead of printing it.
+  It's a good last-ditch net for the "printed back in an error" case it was
+  built for, not a general guarantee about what a downstream command does
+  with the value it's handed.
+- **No sandboxing of what `run`/`capture` invoke.** Once a value is set in a
+  child process's environment, that process (and anything it spawns) has
+  full access to it with no restriction on where it's sent. secretctl trusts
+  the command line it's given completely; there's no allowlist of "safe"
+  destination binaries, and building one would be a materially different,
+  much larger project than this tool.
+- **The audit log proves tampering, it doesn't prevent extraction.** The
+  hash chain (`audit-verify`) detects retroactive edits or deletions to its
+  own history, but it lives in the same user-writable location as
+  everything else, has no external anchor, and by design never records
+  values — if the vault itself were ever exfiltrated, the audit log
+  wouldn't say which secrets were in it.
+- **In-memory plaintext residue is an accepted risk, not a solved one.**
+  `Unprotect-Value` zeroes the BSTR it marshals, but the plaintext also
+  exists as ordinary `System.String` values elsewhere in the same functions
+  for their lifetime. Setting a variable to `$null` drops the reference, not
+  the heap bytes — a memory dump of `pwsh.exe` taken during or shortly after
+  an operation could recover it. High bar to exploit, but real.
+- **Windows Hello's own failure modes are real.** No enrollment on a given
+  machine means every Hello-gated verb falls back to typed console
+  confirmation (still human-only, so an agent's call still fails closed —
+  see [above](#windows-hello-approval)), but the effective strength of
+  `reveal`/`delete`/`allow`/new-target-push depends on Hello staying
+  configured. And Hello proves a human with enrolled biometrics tapped yes —
+  it doesn't prove they understood what they approved; nothing here defends
+  against approval fatigue if requests were ever spammed (which is exactly
+  why the agent guidance above says not to spam them).
+
 ## How it works
 
 - **Vault**: `%LOCALAPPDATA%\secretctl\vault.json`. Values are encrypted at
@@ -78,17 +143,69 @@ and no biometric prompt can substitute for that.
   (Task Manager, WMI, `ps`).
 - **Run**: `secretctl run -Name X -- <command>` injects the decrypted value
   into that one child process's environment, then scans the child's combined
-  stdout/stderr and replaces every literal occurrence of the value with
-  `[REDACTED]` before printing it. This covers the case a plain env-var
-  injection doesn't: a subprocess that echoes the secret back in an error
-  message (a malformed-connection-string exception, a verbose driver log)
-  never actually leaks it to whatever is reading the command's output.
+  stdout/stderr and replaces every literal occurrence of the value — plus a
+  URL-encoded and base64-encoded rendering of it — with `[REDACTED]` before
+  printing it. This covers the case a plain env-var injection doesn't: a
+  subprocess that echoes the secret back in an error message (a
+  malformed-connection-string exception, a verbose driver log) never
+  actually leaks it to whatever is reading the command's output. See
+  [Threat model](#threat-model--what-this-actually-stops-and-what-it-doesnt)
+  for what this redaction does and doesn't cover.
+
+## A fundamental argument-passing bug, and why every invocation is now encoded
+
+An independent review of this codebase surfaced a real, reproducible bug:
+passing a downstream argument shaped like `-word:word` (e.g.
+`-storepass:env`, a genuine Java `keytool` convention for keeping a
+password out of argv by naming an environment variable instead) through
+`run`/`capture` got silently corrupted — split into two separate arguments
+— defeating the exact guarantee those verbs exist to provide. Someone hit
+this for real generating an Android keystore and had to work around it by
+putting the plaintext directly in a downstream process's argv instead,
+exactly the exposure this tool exists to prevent.
+
+Traced to the actual root cause rather than patched around the symptom:
+**`pwsh.exe`'s own startup command-line parser** silently splits any
+argument shaped like `-word:word` into two arguments, before
+`secretctl.ps1` — or any script it invokes — ever runs a single line of
+code. Confirmed directly with a minimal one-argument reproduction
+independent of anything in this codebase: `pwsh.exe -File script.ps1
+-storepass:env` hands the script `@("-storepass", "env")`, not
+`@("-storepass:env")`. Since secretctl.ps1 is always launched as a brand
+new `pwsh.exe` process (via the shims), this corrupted its own top-level
+argument list for any command line containing that shape, anywhere in it —
+not something any internal rewrite of this script's own argument-parsing
+logic could have caught, since the damage is done before the script starts.
+
+The fix had to happen at the process-launch boundary: no raw argument is
+put on `pwsh.exe`'s command line at all anymore. The `secretctl` (bash) shim
+now base64-encodes every argument and hands them to `secretctl.ps1` via an
+environment variable (`SECRETCTL_ENCODED_ARGS`) instead of argv — env vars
+aren't subject to this parsing bug — and `secretctl.ps1` decodes them back
+into the real argument list as the very first thing it does. Verified via
+direct reproduction before and after: the exact `-storepass:env` case now
+survives intact end-to-end through a real downstream process, confirmed via
+a genuine non-PowerShell target so the test wasn't just re-triggering the
+same `pwsh.exe` parsing bug at a different layer.
+
+`secretctl.cmd` (the native Windows shim, for bare `secretctl` from
+PowerShell/cmd) has this same underlying exposure and is not yet fixed the
+same way — CMD batch has no native base64 encoding to build an equivalent
+fix from. If you need to pass a `-word:word`-shaped argument through `run`
+from a native PowerShell session, call `secretctl.ps1` directly via the
+call operator (`& C:\path\secretctl.ps1 run ...`) from inside an already-running
+PowerShell 7 session instead of the bare `secretctl` command — that path
+doesn't spawn a new `pwsh.exe` process with raw argv, so it isn't subject to
+this bug at all.
 
 ## Windows Hello approval
 
-Four things require approval before they happen: **`reveal`**, **`allow`**,
-the **first push to a target a secret hasn't used before**, and **`delete`**
-(unless `-Force`). Approval works the same way for all four:
+Five things require approval before they happen: **`reveal`**, **`allow`**,
+the **first push to a target a secret hasn't used before**, **`delete`**
+(unless `-Force`), and **`rotate -RepushAll`** (as one aggregate approval
+covering the whole redistribution, separate from each target's own standing
+grant — see [below](#rotate--repushall-gets-its-own-approval) for why).
+Approval works the same way for all five:
 
 1. secretctl calls `Windows.Security.Credentials.UI.UserConsentVerifier`
    (via a disposable Windows PowerShell 5.1 subprocess — pwsh 7 can't
@@ -139,6 +256,29 @@ detects it as a diff, robust to the exact title changing across Windows
 versions) and force that one to the foreground and flash it. Verified live,
 twice, including once with a fullscreen video playing over everything else
 on screen — the prompt still came to the front both times.
+
+This diffing approach has a known, accepted limitation: it's racy by
+construction. If some unrelated window (a notification, another app
+launching) happens to appear as a "new" top-level window in the same
+roughly-4.5-second polling span, it could get forced to the foreground
+instead of the real dialog. When multiple new windows appear, secretctl
+prefers one actually titled "Windows Security" over forcing all of them
+indiscriminately — narrows the race, doesn't eliminate it — falling back to
+forcing every new window only if none match that title, so this still
+works if a future Windows version renames the dialog.
+
+### `rotate -RepushAll` gets its own approval
+
+Each individual push inside `rotate -RepushAll` passes the destination
+allow-list silently, since those targets were already approved
+individually in the past — by design, so routine automation doesn't
+re-prompt per target every time. But redistributing a freshly rotated value
+to *every* one of them in a single call is a categorically bigger action
+than any one push: if an agent were ever misdirected into rotating the
+wrong secret, this is the moment that would silently overwrite it
+everywhere the old value went, all at once. That aggregate step gets its
+own Hello approval, naming every destination about to receive the new
+value, on top of (not instead of) each target's own standing grant.
 
 
 ## Generating Cloudflare API tokens
@@ -380,3 +520,15 @@ depends on (`ConvertFrom-Json -AsHashtable`, `RandomNumberGenerator.Fill`).
   clipboard, for up to 45 seconds (or until overwritten). This is the
   accepted tradeoff for making `reveal` agent-triggerable without ever
   putting the value in an agent-readable output stream.
+- Backup/sync tools could in principle carry the encrypted vault file off
+  this machine. Checked directly on the machine this was built on:
+  `%LOCALAPPDATA%` (where the vault lives) is not under this account's
+  OneDrive folder, so it isn't swept up by OneDrive sync here — but this
+  isn't guaranteed on every machine, and DPAPI decryption stays bound to
+  this exact user + machine regardless, so a copy of the file alone doesn't
+  help an attacker decrypt it.
+- `secretctl.cmd` (the native Windows shim) has the same `pwsh.exe`
+  argv-corruption exposure described in
+  [the section above](#a-fundamental-argument-passing-bug-and-why-every-invocation-is-now-encoded)
+  and isn't fixed the same way yet — only the bash shim's fix has an
+  equivalent in place.

@@ -33,6 +33,27 @@ decrypt the vault file even if they copy it.
 
 $ErrorActionPreference = 'Stop'
 
+# secretctl.ps1 always runs as a brand-new pwsh.exe process (spawned by the
+# shims), and pwsh.exe's own startup command-line parser has a confirmed
+# bug: any argument shaped like "-word:word" (e.g. "-storepass:env", a real
+# Java keytool convention) is silently split into two separate arguments
+# BEFORE this script ever runs - reproduced directly with a minimal
+# single-argument repro, independent of anything in this script's own code,
+# so no internal fix here could have caught it. The only fix is to never put
+# a raw argument on pwsh.exe's own process-creation command line at all: the
+# shims base64-encode every argument and hand them over via an environment
+# variable instead (env vars aren't subject to this argv-tokenization bug),
+# decoded here as the very first thing this script does.
+if ($env:SECRETCTL_ENCODED_ARGS) {
+    $decodedArgs = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($env:SECRETCTL_ENCODED_ARGS -split "`n")) {
+        if ([string]::IsNullOrEmpty($line)) { continue }
+        $decodedArgs.Add([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line)))
+    }
+    $args = $decodedArgs.ToArray()
+    Remove-Item Env:\SECRETCTL_ENCODED_ARGS -ErrorAction SilentlyContinue
+}
+
 $VaultDir  = Join-Path $env:LOCALAPPDATA 'secretctl'
 $VaultPath = Join-Path $VaultDir 'vault.json'
 $AuditPath = Join-Path $VaultDir 'audit.log'
@@ -733,7 +754,16 @@ public class SecretctlWin32 {
         $after = [SecretctlWin32]::GetVisibleWindows()
         $newWindows = $after | Where-Object { $before -notcontains $_ }
         if ($newWindows.Count -gt 0) {
-            foreach ($w in $newWindows) {
+            # If an unrelated window (a notification, another app launching)
+            # happens to appear as a "new" window in the same ~150ms-4.5s
+            # polling window, prefer one actually titled "Windows Security"
+            # over forcing every new window indiscriminately - narrows, but
+            # does not eliminate, that race. Falls back to forcing all new
+            # windows if none match, so this still works if Windows renames
+            # the dialog in a future version.
+            $securityWindows = @($newWindows | Where-Object { [SecretctlWin32]::GetTitle($_) -eq 'Windows Security' })
+            $toForce = if ($securityWindows.Count -gt 0) { $securityWindows } else { $newWindows }
+            foreach ($w in $toForce) {
                 [SecretctlWin32]::ShowWindow($w, 9) | Out-Null   # SW_RESTORE
                 [SecretctlWin32]::SetForegroundWindow($w) | Out-Null
                 [SecretctlWin32]::FlashWindow($w, $true) | Out-Null
@@ -926,6 +956,25 @@ function Cmd-Rotate([string[]]$rest) {
     Write-Output "Rotated '$Name'. Preview: $($entry.preview)"
 
     if ($RepushAll -and $entry.pushedTo) {
+        # Each individual push below will pass Assert-TargetAllowed silently,
+        # since these targets were already approved individually in the
+        # past - by design, so routine automation doesn't re-prompt per
+        # target. But redistributing a freshly rotated value to every one of
+        # them in a single call is a categorically bigger action than any
+        # one push: if an agent were ever misdirected into rotating the
+        # wrong secret, this is what would silently overwrite it everywhere
+        # the old value went, all at once. That aggregate step gets its own
+        # approval, separate from (and in addition to) each target's
+        # standing per-target grant.
+        $targetList = ($entry.pushedTo | ForEach-Object { $_.target }) -join ', '
+        $approved = Request-HumanApproval "secretctl: approve redistributing rotated '$Name' to all $($entry.pushedTo.Count) previously-approved destination(s): $targetList?"
+        if ($approved -eq $false) {
+            Write-Error "Rotation of '$Name' succeeded, but repush was not approved (Windows Hello declined, timed out, or is unavailable and this call is non-interactive). Push to each destination individually if that's still intended."
+        }
+        if ($null -eq $approved) {
+            $confirm = Read-Host "About to redistribute rotated '$Name' to $($entry.pushedTo.Count) destination(s). Type the secret name to confirm"
+            if ($confirm -ne $Name) { Write-Error "Confirmation did not match; repush aborted (rotation already happened)." }
+        }
         foreach ($p in $entry.pushedTo) {
             $pushArgs = @('-Name', $Name, '-Target', $p.target)
             if ($p.envName)   { $pushArgs += @('-EnvName', $p.envName) }
@@ -995,6 +1044,17 @@ function Cmd-Run([string[]]$rest) {
         $output = $output.Replace($v, '[REDACTED]')
         $urlEncoded = [Uri]::EscapeDataString($v)
         if ($urlEncoded -ne $v) { $output = $output.Replace($urlEncoded, '[REDACTED]') }
+        # Also catch the value re-encoded as base64, a common transform for
+        # auth headers/tokens that a child process might echo back that way
+        # rather than verbatim. This is still just a literal string-replace
+        # against a handful of known transforms, not a real barrier - any
+        # transform not covered here (hex, truncation, case change, a value
+        # written to a file or sent over the network instead of printed)
+        # sails through untouched. Documented as such, not oversold.
+        try {
+            $base64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($v))
+            if ($base64 -ne $v) { $output = $output.Replace($base64, '[REDACTED]') }
+        } catch {}
     }
     $plainValues.Clear()
 
