@@ -225,6 +225,42 @@ behind instead of actually removing it — fixed by going straight to
 already-running processes keep their existing copy in memory until
 restarted, same as any Windows environment variable change.
 
+### Scanning a remote machine over SSH
+
+The same scan works against a remote host's environment and specific config
+files, for importing secrets that only ever lived on a server (a VM's
+service `.env` file, say) into this local vault:
+
+```
+secretctl scan-env -Via ssh:oracle-vm -Files "/opt/hermes/state/.env"
+```
+
+This runs `bash -lc env` on the remote host (a login shell, so it catches
+vars exported from `.bashrc`/`.profile`, not just a bare non-interactive
+shell's sparse environment) plus a `grep` for key names in each `-Files`
+path given — names and lengths only, same rule as the local scan. To vault
+one, `capture` again needs no new mechanism:
+
+```
+secretctl capture -Name HERMES_GITHUB_TOKEN -- ssh oracle-vm "grep '^GITHUB_TOKEN=' /opt/hermes/state/.env | cut -d= -f2- | sed 's/\r$//'"
+```
+
+**Watch for Git Bash's automatic path mangling** if driving this from a
+POSIX shell on Windows: a `-Files` value starting with `/` (a real remote
+path) gets silently rewritten into a local Windows path before it ever
+reaches PowerShell, unless you set `MSYS_NO_PATHCONV=1` first. Confirmed the
+hard way — the scan just came back empty, no error, because the remote
+`grep` was quietly searching for a mangled path that doesn't exist on the
+remote host at all.
+
+Nothing about `-Via ssh:` touches the remote machine beyond a read - it
+doesn't remove or modify anything there. `clear-env` remains local-only
+(`-Scope User|Machine`, both Windows registry scopes) on purpose: a
+variable on your own machine you've forgotten about is very different from
+one a live remote service is actively reading from a config file — deleting
+the latter risks breaking a running system, so that step is left to you to
+do deliberately on the VM itself, not something this tool automates.
+
 ## Usage
 
 ```
@@ -235,7 +271,7 @@ secretctl import-file -Name <n> -Path <file> [-Delete] [-Force]
 secretctl cf-list-permission-groups -BootstrapName <vaultName> [-AccountId <id>]
 secretctl cf-create-token -Name <n> -BootstrapName <vaultName> [-TokenName <cf-name>] (-PolicyJson <json> | -PolicyFile <path>) [-Force]
 secretctl list
-secretctl scan-env     [-Scope User|Machine|Both] [-Pattern <regex>]
+secretctl scan-env     [-Scope User|Machine|Both] [-Pattern <regex>] [-Via ssh:<host> [-Files <path1,path2,...>]]
 secretctl clear-env    -EnvVar <name> [-EnvVar <name> ...] -Scope User|Machine   (Windows Hello approval)
 secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|wrangler:worker-name|file:<path>
                        [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name] [-Cwd dir]

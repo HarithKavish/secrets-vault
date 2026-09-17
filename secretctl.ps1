@@ -477,36 +477,93 @@ function Cmd-List([string[]]$rest) {
 function Cmd-ScanEnv([string[]]$rest) {
     $Scope   = Get-Named $rest '-Scope' 'Both'
     $Pattern = Get-Named $rest '-Pattern'
-    $scopes = switch ($Scope) {
-        'User'    { @('User') }
-        'Machine' { @('Machine') }
-        'Both'    { @('User', 'Machine') }
-        default   { Write-Error "Invalid -Scope '$Scope'. Use User, Machine, or Both." }
-    }
+    $Via     = Get-Named $rest '-Via'
+    $Files   = Get-Named $rest '-Files'
+
     # Heuristic on the NAME only - never the value. Not exhaustive (a secret
     # named oddly won't be flagged) and not proof (e.g. TOKENIZER_PATH would
     # false-positive on TOKEN) - it's a starting point for a human/agent to
     # look at, not a verdict.
     $secretHeuristic = '(KEY|SECRET|TOKEN|PASS(WORD)?|PWD|CREDENTIAL|AUTH|APIKEY|CONN(ECTION)?STR|DSN|CERT|PRIVATE|CLIENT_SECRET|ACCESS_KEY|URI|URL)'
+    $rows = @()
 
-    $rows = foreach ($sc in $scopes) {
-        $vars = [Environment]::GetEnvironmentVariables($sc)
-        foreach ($key in ($vars.Keys | Sort-Object)) {
+    if ($Via -and $Via -match '^ssh:(.+)$') {
+        $sshHost = $Matches[1]
+        # bash -lc env (a login shell), not a bare non-interactive shell's
+        # sparse environment - this is what actually catches vars exported
+        # from .bashrc/.bash_profile/.profile.
+        $remoteEnv = ssh $sshHost "bash -lc env" 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "ssh to '$sshHost' failed (exit $LASTEXITCODE). Check the host is reachable and the SSH alias/config is correct."
+        }
+        foreach ($line in $remoteEnv) {
+            $idx = $line.IndexOf('=')
+            if ($idx -lt 1) { continue }
+            $key = $line.Substring(0, $idx)
+            $val = $line.Substring($idx + 1)
             if ($Pattern -and $key -notmatch $Pattern) { continue }
-            $val = $vars[$key]
-            [pscustomobject]@{
+            $rows += [pscustomobject]@{
                 Name        = $key
-                Scope       = $sc
-                Length      = if ($val) { $val.Length } else { 0 }
+                Scope       = "ssh:$sshHost env"
+                Length      = $val.Length
                 LooksSecret = if ($key -match $secretHeuristic) { 'YES' } else { '' }
             }
         }
+
+        if ($Files) {
+            foreach ($f in ($Files -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+                $kvLines = ssh $sshHost "grep -E '^[A-Za-z_][A-Za-z0-9_]*=' '$f' 2>/dev/null" 2>$null
+                foreach ($line in $kvLines) {
+                    $idx = $line.IndexOf('=')
+                    if ($idx -lt 1) { continue }
+                    $key = $line.Substring(0, $idx)
+                    $val = $line.Substring($idx + 1)
+                    if ($Pattern -and $key -notmatch $Pattern) { continue }
+                    $rows += [pscustomobject]@{
+                        Name        = $key
+                        Scope       = "ssh:${sshHost}:$f"
+                        Length      = $val.Length
+                        LooksSecret = if ($key -match $secretHeuristic) { 'YES' } else { '' }
+                    }
+                }
+            }
+        }
+    } else {
+        $scopes = switch ($Scope) {
+            'User'    { @('User') }
+            'Machine' { @('Machine') }
+            'Both'    { @('User', 'Machine') }
+            default   { Write-Error "Invalid -Scope '$Scope'. Use User, Machine, or Both." }
+        }
+        foreach ($sc in $scopes) {
+            $vars = [Environment]::GetEnvironmentVariables($sc)
+            foreach ($key in ($vars.Keys | Sort-Object)) {
+                if ($Pattern -and $key -notmatch $Pattern) { continue }
+                $val = $vars[$key]
+                $rows += [pscustomobject]@{
+                    Name        = $key
+                    Scope       = $sc
+                    Length      = if ($val) { $val.Length } else { 0 }
+                    LooksSecret = if ($key -match $secretHeuristic) { 'YES' } else { '' }
+                }
+            }
+        }
     }
+
     if (@($rows).Count -eq 0) { Write-Output "(no matching environment variables)"; return }
     $rows | Sort-Object @{Expression = 'LooksSecret'; Descending = $true }, Scope, Name |
         Format-Table -AutoSize | Out-String -Width 200 | Write-Output
-    Write-Output "Names and lengths only - values are never shown here. To vault one blind:"
-    Write-Output "  secretctl capture -Name <vaultName> -- pwsh -NoProfile -Command `"[Environment]::GetEnvironmentVariable('<VarName>','<Scope>')`""
+    Write-Output "Names and lengths only - values are never shown here."
+    if ($Via -and $Via -match '^ssh:(.+)$') {
+        $sshHost = $Matches[1]
+        Write-Output "To vault one blind from the remote environment:"
+        Write-Output "  secretctl capture -Name <vaultName> -- ssh $sshHost `"printenv '<VarName>'`""
+        Write-Output "To vault one blind from a scanned file:"
+        Write-Output "  secretctl capture -Name <vaultName> -- ssh $sshHost `"grep '^<VarName>=' '<file>' | cut -d= -f2-`""
+    } else {
+        Write-Output "To vault one blind:"
+        Write-Output "  secretctl capture -Name <vaultName> -- pwsh -NoProfile -Command `"[Environment]::GetEnvironmentVariable('<VarName>','<Scope>')`""
+    }
 }
 
 function Cmd-ClearEnvVar([string[]]$rest) {
@@ -1047,7 +1104,7 @@ sensitive ones are gated by Windows Hello, not by "is a human typing here."
   secretctl cf-list-permission-groups -BootstrapName <vaultName> [-AccountId <id>]
   secretctl cf-create-token -Name <n> -BootstrapName <vaultName> [-TokenName <cf-name>] (-PolicyJson <json> | -PolicyFile <path>) [-Force]
   secretctl list
-  secretctl scan-env     [-Scope User|Machine|Both] [-Pattern <regex>]
+  secretctl scan-env     [-Scope User|Machine|Both] [-Pattern <regex>] [-Via ssh:<host> [-Files <path1,path2,...>]]
   secretctl clear-env    -EnvVar <name> -Scope User|Machine          (Windows Hello approval)
   secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|wrangler:worker-name|file:<path> [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name] [-Cwd dir]
   secretctl run         [-Name <n> [-As ENV_VAR]] [-Env ENV_VAR=VaultName ...] -- <command> [args...]
