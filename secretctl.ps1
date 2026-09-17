@@ -33,6 +33,27 @@ decrypt the vault file even if they copy it.
 
 $ErrorActionPreference = 'Stop'
 
+# secretctl.ps1 always runs as a brand-new pwsh.exe process (spawned by the
+# shims), and pwsh.exe's own startup command-line parser has a confirmed
+# bug: any argument shaped like "-word:word" (e.g. "-storepass:env", a real
+# Java keytool convention) is silently split into two separate arguments
+# BEFORE this script ever runs - reproduced directly with a minimal
+# single-argument repro, independent of anything in this script's own code,
+# so no internal fix here could have caught it. The only fix is to never put
+# a raw argument on pwsh.exe's own process-creation command line at all: the
+# shims base64-encode every argument and hand them over via an environment
+# variable instead (env vars aren't subject to this argv-tokenization bug),
+# decoded here as the very first thing this script does.
+if ($env:SECRETCTL_ENCODED_ARGS) {
+    $decodedArgs = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($env:SECRETCTL_ENCODED_ARGS -split "`n")) {
+        if ([string]::IsNullOrEmpty($line)) { continue }
+        $decodedArgs.Add([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($line)))
+    }
+    $args = $decodedArgs.ToArray()
+    Remove-Item Env:\SECRETCTL_ENCODED_ARGS -ErrorAction SilentlyContinue
+}
+
 $VaultDir  = Join-Path $env:LOCALAPPDATA 'secretctl'
 $VaultPath = Join-Path $VaultDir 'vault.json'
 $AuditPath = Join-Path $VaultDir 'audit.log'
@@ -477,36 +498,93 @@ function Cmd-List([string[]]$rest) {
 function Cmd-ScanEnv([string[]]$rest) {
     $Scope   = Get-Named $rest '-Scope' 'Both'
     $Pattern = Get-Named $rest '-Pattern'
-    $scopes = switch ($Scope) {
-        'User'    { @('User') }
-        'Machine' { @('Machine') }
-        'Both'    { @('User', 'Machine') }
-        default   { Write-Error "Invalid -Scope '$Scope'. Use User, Machine, or Both." }
-    }
+    $Via     = Get-Named $rest '-Via'
+    $Files   = Get-Named $rest '-Files'
+
     # Heuristic on the NAME only - never the value. Not exhaustive (a secret
     # named oddly won't be flagged) and not proof (e.g. TOKENIZER_PATH would
     # false-positive on TOKEN) - it's a starting point for a human/agent to
     # look at, not a verdict.
     $secretHeuristic = '(KEY|SECRET|TOKEN|PASS(WORD)?|PWD|CREDENTIAL|AUTH|APIKEY|CONN(ECTION)?STR|DSN|CERT|PRIVATE|CLIENT_SECRET|ACCESS_KEY|URI|URL)'
+    $rows = @()
 
-    $rows = foreach ($sc in $scopes) {
-        $vars = [Environment]::GetEnvironmentVariables($sc)
-        foreach ($key in ($vars.Keys | Sort-Object)) {
+    if ($Via -and $Via -match '^ssh:(.+)$') {
+        $sshHost = $Matches[1]
+        # bash -lc env (a login shell), not a bare non-interactive shell's
+        # sparse environment - this is what actually catches vars exported
+        # from .bashrc/.bash_profile/.profile.
+        $remoteEnv = ssh $sshHost "bash -lc env" 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Error "ssh to '$sshHost' failed (exit $LASTEXITCODE). Check the host is reachable and the SSH alias/config is correct."
+        }
+        foreach ($line in $remoteEnv) {
+            $idx = $line.IndexOf('=')
+            if ($idx -lt 1) { continue }
+            $key = $line.Substring(0, $idx)
+            $val = $line.Substring($idx + 1)
             if ($Pattern -and $key -notmatch $Pattern) { continue }
-            $val = $vars[$key]
-            [pscustomobject]@{
+            $rows += [pscustomobject]@{
                 Name        = $key
-                Scope       = $sc
-                Length      = if ($val) { $val.Length } else { 0 }
+                Scope       = "ssh:$sshHost env"
+                Length      = $val.Length
                 LooksSecret = if ($key -match $secretHeuristic) { 'YES' } else { '' }
             }
         }
+
+        if ($Files) {
+            foreach ($f in ($Files -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })) {
+                $kvLines = ssh $sshHost "grep -E '^[A-Za-z_][A-Za-z0-9_]*=' '$f' 2>/dev/null" 2>$null
+                foreach ($line in $kvLines) {
+                    $idx = $line.IndexOf('=')
+                    if ($idx -lt 1) { continue }
+                    $key = $line.Substring(0, $idx)
+                    $val = $line.Substring($idx + 1)
+                    if ($Pattern -and $key -notmatch $Pattern) { continue }
+                    $rows += [pscustomobject]@{
+                        Name        = $key
+                        Scope       = "ssh:${sshHost}:$f"
+                        Length      = $val.Length
+                        LooksSecret = if ($key -match $secretHeuristic) { 'YES' } else { '' }
+                    }
+                }
+            }
+        }
+    } else {
+        $scopes = switch ($Scope) {
+            'User'    { @('User') }
+            'Machine' { @('Machine') }
+            'Both'    { @('User', 'Machine') }
+            default   { Write-Error "Invalid -Scope '$Scope'. Use User, Machine, or Both." }
+        }
+        foreach ($sc in $scopes) {
+            $vars = [Environment]::GetEnvironmentVariables($sc)
+            foreach ($key in ($vars.Keys | Sort-Object)) {
+                if ($Pattern -and $key -notmatch $Pattern) { continue }
+                $val = $vars[$key]
+                $rows += [pscustomobject]@{
+                    Name        = $key
+                    Scope       = $sc
+                    Length      = if ($val) { $val.Length } else { 0 }
+                    LooksSecret = if ($key -match $secretHeuristic) { 'YES' } else { '' }
+                }
+            }
+        }
     }
+
     if (@($rows).Count -eq 0) { Write-Output "(no matching environment variables)"; return }
     $rows | Sort-Object @{Expression = 'LooksSecret'; Descending = $true }, Scope, Name |
         Format-Table -AutoSize | Out-String -Width 200 | Write-Output
-    Write-Output "Names and lengths only - values are never shown here. To vault one blind:"
-    Write-Output "  secretctl capture -Name <vaultName> -- pwsh -NoProfile -Command `"[Environment]::GetEnvironmentVariable('<VarName>','<Scope>')`""
+    Write-Output "Names and lengths only - values are never shown here."
+    if ($Via -and $Via -match '^ssh:(.+)$') {
+        $sshHost = $Matches[1]
+        Write-Output "To vault one blind from the remote environment:"
+        Write-Output "  secretctl capture -Name <vaultName> -- ssh $sshHost `"printenv '<VarName>'`""
+        Write-Output "To vault one blind from a scanned file:"
+        Write-Output "  secretctl capture -Name <vaultName> -- ssh $sshHost `"grep '^<VarName>=' '<file>' | cut -d= -f2-`""
+    } else {
+        Write-Output "To vault one blind:"
+        Write-Output "  secretctl capture -Name <vaultName> -- pwsh -NoProfile -Command `"[Environment]::GetEnvironmentVariable('<VarName>','<Scope>')`""
+    }
 }
 
 function Cmd-ClearEnvVar([string[]]$rest) {
@@ -676,7 +754,16 @@ public class SecretctlWin32 {
         $after = [SecretctlWin32]::GetVisibleWindows()
         $newWindows = $after | Where-Object { $before -notcontains $_ }
         if ($newWindows.Count -gt 0) {
-            foreach ($w in $newWindows) {
+            # If an unrelated window (a notification, another app launching)
+            # happens to appear as a "new" window in the same ~150ms-4.5s
+            # polling window, prefer one actually titled "Windows Security"
+            # over forcing every new window indiscriminately - narrows, but
+            # does not eliminate, that race. Falls back to forcing all new
+            # windows if none match, so this still works if Windows renames
+            # the dialog in a future version.
+            $securityWindows = @($newWindows | Where-Object { [SecretctlWin32]::GetTitle($_) -eq 'Windows Security' })
+            $toForce = if ($securityWindows.Count -gt 0) { $securityWindows } else { $newWindows }
+            foreach ($w in $toForce) {
                 [SecretctlWin32]::ShowWindow($w, 9) | Out-Null   # SW_RESTORE
                 [SecretctlWin32]::SetForegroundWindow($w) | Out-Null
                 [SecretctlWin32]::FlashWindow($w, $true) | Out-Null
@@ -869,6 +956,25 @@ function Cmd-Rotate([string[]]$rest) {
     Write-Output "Rotated '$Name'. Preview: $($entry.preview)"
 
     if ($RepushAll -and $entry.pushedTo) {
+        # Each individual push below will pass Assert-TargetAllowed silently,
+        # since these targets were already approved individually in the
+        # past - by design, so routine automation doesn't re-prompt per
+        # target. But redistributing a freshly rotated value to every one of
+        # them in a single call is a categorically bigger action than any
+        # one push: if an agent were ever misdirected into rotating the
+        # wrong secret, this is what would silently overwrite it everywhere
+        # the old value went, all at once. That aggregate step gets its own
+        # approval, separate from (and in addition to) each target's
+        # standing per-target grant.
+        $targetList = ($entry.pushedTo | ForEach-Object { $_.target }) -join ', '
+        $approved = Request-HumanApproval "secretctl: approve redistributing rotated '$Name' to all $($entry.pushedTo.Count) previously-approved destination(s): $targetList?"
+        if ($approved -eq $false) {
+            Write-Error "Rotation of '$Name' succeeded, but repush was not approved (Windows Hello declined, timed out, or is unavailable and this call is non-interactive). Push to each destination individually if that's still intended."
+        }
+        if ($null -eq $approved) {
+            $confirm = Read-Host "About to redistribute rotated '$Name' to $($entry.pushedTo.Count) destination(s). Type the secret name to confirm"
+            if ($confirm -ne $Name) { Write-Error "Confirmation did not match; repush aborted (rotation already happened)." }
+        }
         foreach ($p in $entry.pushedTo) {
             $pushArgs = @('-Name', $Name, '-Target', $p.target)
             if ($p.envName)   { $pushArgs += @('-EnvName', $p.envName) }
@@ -938,6 +1044,17 @@ function Cmd-Run([string[]]$rest) {
         $output = $output.Replace($v, '[REDACTED]')
         $urlEncoded = [Uri]::EscapeDataString($v)
         if ($urlEncoded -ne $v) { $output = $output.Replace($urlEncoded, '[REDACTED]') }
+        # Also catch the value re-encoded as base64, a common transform for
+        # auth headers/tokens that a child process might echo back that way
+        # rather than verbatim. This is still just a literal string-replace
+        # against a handful of known transforms, not a real barrier - any
+        # transform not covered here (hex, truncation, case change, a value
+        # written to a file or sent over the network instead of printed)
+        # sails through untouched. Documented as such, not oversold.
+        try {
+            $base64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($v))
+            if ($base64 -ne $v) { $output = $output.Replace($base64, '[REDACTED]') }
+        } catch {}
     }
     $plainValues.Clear()
 
@@ -1047,7 +1164,7 @@ sensitive ones are gated by Windows Hello, not by "is a human typing here."
   secretctl cf-list-permission-groups -BootstrapName <vaultName> [-AccountId <id>]
   secretctl cf-create-token -Name <n> -BootstrapName <vaultName> [-TokenName <cf-name>] (-PolicyJson <json> | -PolicyFile <path>) [-Force]
   secretctl list
-  secretctl scan-env     [-Scope User|Machine|Both] [-Pattern <regex>]
+  secretctl scan-env     [-Scope User|Machine|Both] [-Pattern <regex>] [-Via ssh:<host> [-Files <path1,path2,...>]]
   secretctl clear-env    -EnvVar <name> -Scope User|Machine          (Windows Hello approval)
   secretctl push        -Name <n> -Target github:owner/repo|vercel[:project]|wrangler:worker-name|file:<path> [-EnvName NAME] [-RepoEnv env] [-VercelEnv production|preview|development] [-Project name] [-Cwd dir]
   secretctl run         [-Name <n> [-As ENV_VAR]] [-Env ENV_VAR=VaultName ...] -- <command> [args...]
